@@ -37,9 +37,11 @@ pub fn output_update(output: &Output, output_overlap: Option<Rectangle<i32, Logi
                 location += surface_view.offset;
                 TraversalAction::DoChildren((location, false))
             } else {
-                // If we are unmapped we still have to traverse
-                // our children to send leave events
-                TraversalAction::DoChildren((location, true))
+                // Surface has no surface_view. If the parent is mapped (parent_unmapped=false),
+                // this may be a client-rendered subsurface (e.g. CSD decorations from libdecor)
+                // that has a committed buffer but was never processed by the compositor's renderer.
+                // Propagate the parent's mapped state so the processor can handle it correctly.
+                TraversalAction::DoChildren((location, false))
             }
         },
         |wl_surface, states, (location, parent_unmapped)| {
@@ -71,8 +73,15 @@ pub fn output_update(output: &Output, output_overlap: Option<Rectangle<i32, Logi
                     // we should now send leave
                     output.leave(wl_surface);
                 }
+            } else if data.and_then(|d| d.lock().unwrap().buffer().cloned()).is_some() {
+                // Surface has a committed buffer but no surface_view — this is a
+                // client-rendered subsurface (e.g. CSD decorations from libdecor).
+                // The compositor doesn't render it, but the client needs to know which
+                // output it's on to determine the correct scale. Send enter since the
+                // parent is mapped on this output.
+                output.enter(wl_surface);
             } else {
-                // Maybe the the surface got unmapped, send leave on output
+                // No buffer and no surface_view — surface is truly unmapped.
                 output.leave(wl_surface);
             }
         },
