@@ -70,13 +70,24 @@ impl SpaceElement for Window {
         let state = self.user_data().get::<WindowOutputUserData>().unwrap().borrow();
 
         if let Some(surface) = self.wl_surface() {
+            // The stored overlap is relative to the element's bounding box top-left
+            // (computed by Space::refresh as overlap.loc -= bbox.loc). However,
+            // output_update traverses the surface tree starting at (0, 0) for the
+            // root wl_surface. For windows with client-side decorations (CSD), the
+            // bounding box extends beyond the root surface origin (e.g., title bar
+            // at negative Y). We must adjust the overlap to be relative to the root
+            // surface origin so that CSD subsurfaces pass the overlap check.
+            let bbox_loc = self.bbox().loc;
+
             for (weak, overlap) in state.output_overlap.iter() {
                 if let Some(output) = weak.upgrade() {
-                    output_update(&output, Some(*overlap), &surface);
+                    let mut surface_overlap = *overlap;
+                    surface_overlap.loc += bbox_loc;
+                    output_update(&output, Some(surface_overlap), &surface);
                     for (popup, location) in PopupManager::popups_for_surface(&surface) {
-                        let mut overlap = *overlap;
-                        overlap.loc -= location;
-                        output_update(&output, Some(overlap), popup.wl_surface());
+                        let mut popup_overlap = surface_overlap;
+                        popup_overlap.loc -= location;
+                        output_update(&output, Some(popup_overlap), popup.wl_surface());
                     }
                 }
             }
