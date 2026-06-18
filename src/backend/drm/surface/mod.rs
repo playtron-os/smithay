@@ -424,17 +424,23 @@ impl DrmSurface {
     ///
     /// This operation is not blocking and will produce a `vblank` event once swapping is done.
     /// Make sure to have the device registered in your event loop to not miss the event.
+    ///
+    /// When `allow_async` is set (and the driver supports async/immediate page
+    /// flips — `DriverCapability::AtomicASyncPageFlip`/`ASyncPageFlip`), the flip
+    /// is requested as a tearing flip that is applied immediately instead of
+    /// being latched to the next vblank.
     #[profiling::function]
     pub fn page_flip<'a>(
         &self,
         planes: impl IntoIterator<Item = PlaneState<'a>>,
         event: bool,
+        allow_async: bool,
     ) -> Result<(), Error> {
         match &*self.internal {
-            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event),
+            DrmSurfaceInternal::Atomic(surf) => surf.page_flip(planes, event, allow_async),
             DrmSurfaceInternal::Legacy(surf) => {
                 let fb = ensure_legacy_planes(self, planes)?;
-                surf.page_flip(fb, event)
+                surf.page_flip(fb, event, allow_async)
             }
         }
     }

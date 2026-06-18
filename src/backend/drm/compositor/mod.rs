@@ -750,11 +750,13 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
         supports_fencing: bool,
         allow_partial_update: bool,
         event: bool,
+        allow_async: bool,
     ) -> Result<(), crate::backend::drm::error::Error> {
         debug_assert!(!self.planes.iter().any(|(_, state)| state.needs_test));
         surface.page_flip(
             self.build_planes(surface, supports_fencing, allow_partial_update),
             event,
+            allow_async,
         )
     }
 
@@ -965,6 +967,8 @@ where
 struct QueuedFrame<A: Allocator, F: ExportFramebuffer<<A as Allocator>::Buffer>, U> {
     prepared_frame: PreparedFrame<A, F>,
     user_data: U,
+    /// Whether this frame should be presented with a tearing (async) page flip.
+    allow_async: bool,
 }
 
 impl<A, F, U> std::fmt::Debug for QueuedFrame<A, F, U>
@@ -979,6 +983,7 @@ where
         f.debug_struct("QueuedFrame")
             .field("prepared_frame", &self.prepared_frame)
             .field("user_data", &self.user_data)
+            .field("allow_async", &self.allow_async)
             .finish()
     }
 }
@@ -1061,6 +1066,10 @@ where
     primary_plane_element_id: Id,
     primary_plane_damage_bag: DamageBag<i32, BufferCoords>,
     supports_fencing: bool,
+    /// Whether the driver/CRTC supports async (tearing/immediate) page flips.
+    supports_tearing: bool,
+    /// Whether the next queued frame should request a tearing page flip.
+    tearing: bool,
     reset_pending: bool,
     signaled_fence: Option<Arc<OwnedFd>>,
 
@@ -1205,6 +1214,16 @@ where
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
             && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
 
+        // Async (tearing/immediate) page-flip support, queried like fencing.
+        let supports_tearing = surface
+            .get_driver_capability(if surface.is_legacy() {
+                DriverCapability::ASyncPageFlip
+            } else {
+                DriverCapability::AtomicASyncPageFlip
+            })
+            .map(|val| val != 0)
+            .unwrap_or(false);
+
         for format in color_formats {
             debug!("Testing color format: {}", format);
             match Self::find_supported_format(
@@ -1267,6 +1286,8 @@ where
                         opaque_regions: Vec::new(),
                         element_opaque_regions_workhouse: Vec::new(),
                         supports_fencing,
+                        supports_tearing,
+                        tearing: false,
                         debug_flags: DebugFlags::empty(),
                         span,
                     };
@@ -1388,6 +1409,16 @@ where
             && plane_has_property(&*surface, surface.plane(), "IN_FENCE_FD")?
             && !(is_nvidia && nvidia_drm_version().unwrap_or((0, 0, 0)) < (560, 35, 3));
 
+        // Async (tearing/immediate) page-flip support, queried like fencing.
+        let supports_tearing = surface
+            .get_driver_capability(if surface.is_legacy() {
+                DriverCapability::ASyncPageFlip
+            } else {
+                DriverCapability::AtomicASyncPageFlip
+            })
+            .map(|val| val != 0)
+            .unwrap_or(false);
+
         let (swapchain, is_opaque) = Self::test_format(
             &surface,
             supports_fencing,
@@ -1449,6 +1480,8 @@ where
             opaque_regions: Vec::new(),
             element_opaque_regions_workhouse: Vec::new(),
             supports_fencing,
+            supports_tearing,
+            tearing: false,
             debug_flags: DebugFlags::empty(),
             span,
         };
@@ -2458,6 +2491,7 @@ where
         self.queued_frame = Some(QueuedFrame {
             prepared_frame,
             user_data,
+            allow_async: self.tearing,
         });
         if self.pending_frame.is_none() {
             self.submit()?;
@@ -2528,11 +2562,31 @@ where
         Ok(())
     }
 
+    /// Whether the driver/CRTC supports tearing (async / immediate) page flips.
+    ///
+    /// Returns `false` for legacy surfaces whose driver lacks `DRM_CAP_ASYNC_PAGE_FLIP`
+    /// or atomic surfaces lacking `DRM_CAP_ATOMIC_ASYNC_PAGE_FLIP`.
+    pub fn supports_tearing(&self) -> bool {
+        self.supports_tearing
+    }
+
+    /// Request that subsequently [queued](DrmCompositor::queue_frame) frames be
+    /// presented with a tearing (immediate, non-vblank-latched) page flip when
+    /// the driver supports it. The flag persists until changed; it is silently
+    /// ignored when [`supports_tearing`](DrmCompositor::supports_tearing) is `false`.
+    ///
+    /// Only the page-flip path can tear — frames that require a modeset commit
+    /// are always presented synchronously.
+    pub fn set_tearing(&mut self, tearing: bool) {
+        self.tearing = tearing;
+    }
+
     #[profiling::function]
     fn submit(&mut self) -> FrameResult<(), A, F> {
         let QueuedFrame {
             mut prepared_frame,
             user_data,
+            allow_async,
         } = self.queued_frame.take().unwrap();
 
         let allow_partial_update = prepared_frame.kind == PreparedFrameKind::Partial;
@@ -2541,9 +2595,15 @@ where
                 .frame
                 .commit(&self.surface, self.supports_fencing, allow_partial_update, true)
         } else {
-            prepared_frame
-                .frame
-                .page_flip(&self.surface, self.supports_fencing, allow_partial_update, true)
+            // Tearing is only ever applied on the page-flip path (never on a
+            // modeset commit), and only if the driver actually supports it.
+            prepared_frame.frame.page_flip(
+                &self.surface,
+                self.supports_fencing,
+                allow_partial_update,
+                true,
+                allow_async && self.supports_tearing,
+            )
         };
 
         self.handle_flip(prepared_frame, Some(user_data), flip)
