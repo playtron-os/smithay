@@ -358,6 +358,16 @@ impl LayerMap {
                 if size.h.0 == 0 {
                     size.h.0 = source.size.h.0 / 2;
                 }
+                // Optional compositor-driven max height: cap the surface to a
+                // fraction of the (here, non-exclusive) zone. Applied before the
+                // anchored override so a vertically-anchored (stretched) surface
+                // ignores it; `y` (centering/placement below) then uses the
+                // capped height. See [`set_layer_max_height`].
+                if let Some(cap) = layer_max_height(surface).map(|m| m.resolve(source.size.h.0)) {
+                    if cap > 0 {
+                        size.h = size.h.min(Saturating(cap));
+                    }
+                }
                 if data.anchor.anchored_horizontally() {
                     size.w = source.size.w;
                 }
@@ -377,6 +387,16 @@ impl LayerMap {
                     source.loc.y + Saturating(data.margin.top)
                 } else if data.anchor.contains(Anchor::BOTTOM) {
                     source.loc.y + (source.size.h - size.h)
+                } else if let Some(placement) = layer_vertical_placement(surface) {
+                    // Compositor-driven placement: position the top edge at a
+                    // fraction of the (here, non-exclusive) zone instead of
+                    // centering. `source` is the surface's layout zone, so this
+                    // tracks panels and output changes on every arrange.
+                    Saturating(resolve_vertical_placement(
+                        source.loc.y.0,
+                        source.size.h.0,
+                        placement,
+                    ))
                 } else {
                     source.loc.y + Saturating((source.size.h.0 / 2) - (size.h.0 / 2))
                 };
@@ -507,6 +527,126 @@ pub fn layer_state(layer: &LayerSurface) -> MutexGuard<'_, LayerState> {
     let userdata = layer.user_data();
     userdata.insert_if_missing_threadsafe(LayerUserdata::default);
     userdata.get::<LayerUserdata>().unwrap().lock().unwrap()
+}
+
+/// Compositor-driven vertical placement of a non-anchored layer surface within
+/// the output's non-exclusive zone.
+///
+/// When set on a surface via [`set_layer_vertical_placement`], [`LayerMap::arrange`]
+/// positions the surface's top edge at
+/// `zone.top + round(fraction * zone.height) + offset`, clamped so the top edge
+/// is at least `min_margin` below the zone top — instead of vertically centering
+/// it. Here `zone` is the rectangle the surface is laid out within: the
+/// non-exclusive zone for a neutral-exclusive-zone surface (the common case for
+/// overlays), i.e. the output minus every panel/dock exclusive zone.
+///
+/// This only takes effect while the surface is **not** anchored vertically
+/// (neither [`Anchor::TOP`] nor [`Anchor::BOTTOM`]); an anchored surface keeps
+/// the standard anchor + margin placement. Horizontal placement is unaffected
+/// (a non-horizontally-anchored surface stays centered within the zone).
+///
+/// Because the placement is re-evaluated on every [`LayerMap::arrange`], the
+/// surface stays correctly positioned across relayouts (panels mapping,
+/// resizing, or the surface moving to another output) with no client round-trip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VerticalPlacement {
+    /// Fraction of the zone height (typically `0.0..=1.0`) at which to place the
+    /// surface's top edge.
+    pub fraction: f64,
+    /// Additional vertical offset in logical pixels, applied after `fraction`
+    /// (signed: negative shifts the surface up).
+    pub offset: i32,
+    /// Minimum gap, in logical pixels, between the zone's top edge and the
+    /// surface's top edge. The resolved top is clamped to be at least this far
+    /// below the zone top.
+    pub min_margin: i32,
+}
+
+type LayerVerticalPlacementData = Mutex<Option<VerticalPlacement>>;
+
+/// Set or clear the compositor-driven [`VerticalPlacement`] for a layer surface.
+///
+/// The placement is stored on the surface and honored by [`LayerMap::arrange`]
+/// for non-vertically-anchored surfaces; pass `None` to revert to the default
+/// (vertical centering within the zone). Call [`LayerMap::arrange`] on the
+/// surface's output afterwards for the change to take effect.
+pub fn set_layer_vertical_placement(surface: &WlSurface, placement: Option<VerticalPlacement>) {
+    with_states(surface, |states| {
+        let entry = states
+            .data_map
+            .get_or_insert_threadsafe(LayerVerticalPlacementData::default);
+        *entry.lock().unwrap() = placement;
+    });
+}
+
+/// Read the compositor-driven [`VerticalPlacement`] for a layer surface, if any.
+fn layer_vertical_placement(surface: &WlSurface) -> Option<VerticalPlacement> {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<LayerVerticalPlacementData>()
+            .and_then(|m| *m.lock().unwrap())
+    })
+}
+
+/// Resolve a [`VerticalPlacement`] into a top-edge coordinate within a zone of
+/// `[zone_top, zone_top + zone_height]`. Factored out for unit testing.
+fn resolve_vertical_placement(zone_top: i32, zone_height: i32, placement: VerticalPlacement) -> i32 {
+    let zone_height = zone_height.max(0);
+    let top = (placement.fraction * zone_height as f64).round() as i32;
+    zone_top + top.saturating_add(placement.offset).max(placement.min_margin)
+}
+
+/// Compositor-driven maximum height for a layer surface, as a fraction of the
+/// (here, non-exclusive) zone it is laid out within.
+///
+/// When set on a surface via [`set_layer_max_height`], [`LayerMap::arrange`]
+/// clamps the surface's height to `max(round(fraction * zone_height), min_px)`
+/// (in addition to the implicit clamp to the zone). Combined with vertical
+/// centering or a [`VerticalPlacement`], this lets the compositor keep an
+/// overlay sized to a fraction of the usable area across relayouts, so the
+/// client can request its full content height without recomputing a cap from a
+/// (possibly stale) usable-area value.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MaxHeight {
+    /// Fraction of the zone height (typically `0.0..=1.0`) to cap the surface to.
+    pub fraction: f64,
+    /// Floor, in logical pixels, for the resolved cap (so a small zone can't
+    /// shrink the surface below a usable minimum). `0` for no floor.
+    pub min_px: i32,
+}
+
+impl MaxHeight {
+    /// Resolve this cap to a pixel height for a zone of `zone_height` px.
+    fn resolve(&self, zone_height: i32) -> i32 {
+        ((self.fraction * zone_height.max(0) as f64).round() as i32).max(self.min_px)
+    }
+}
+
+type LayerMaxHeightData = Mutex<Option<MaxHeight>>;
+
+/// Set or clear the compositor-driven [`MaxHeight`] for a layer surface.
+///
+/// Stored on the surface and honored by [`LayerMap::arrange`]; pass `None` to
+/// remove the cap. Call [`LayerMap::arrange`] on the surface's output afterwards
+/// for the change to take effect.
+pub fn set_layer_max_height(surface: &WlSurface, max_height: Option<MaxHeight>) {
+    with_states(surface, |states| {
+        let entry = states
+            .data_map
+            .get_or_insert_threadsafe(LayerMaxHeightData::default);
+        *entry.lock().unwrap() = max_height;
+    });
+}
+
+/// Read the compositor-driven [`MaxHeight`] for a layer surface, if any.
+fn layer_max_height(surface: &WlSurface) -> Option<MaxHeight> {
+    with_states(surface, |states| {
+        states
+            .data_map
+            .get::<LayerMaxHeightData>()
+            .and_then(|m| *m.lock().unwrap())
+    })
 }
 
 /// A [`LayerSurface`] represents a single layer surface as given by the wlr-layer-shell protocol.
@@ -799,5 +939,78 @@ mod test {
             implied_exclusive_edge_for_anchor(Anchor::LEFT | Anchor::TOP | Anchor::RIGHT),
             Some(Anchor::TOP)
         );
+    }
+
+    #[test]
+    fn vertical_placement_centered_fraction() {
+        // A zone [top=20, height=1000]. fraction 0.5, no offset → top edge at the
+        // zone's vertical center (this is `top` of the surface, not its center).
+        let p = VerticalPlacement {
+            fraction: 0.5,
+            offset: 0,
+            min_margin: 0,
+        };
+        assert_eq!(resolve_vertical_placement(20, 1000, p), 20 + 500);
+    }
+
+    #[test]
+    fn vertical_placement_offset_and_clamp() {
+        // Spotlight-style: top edge at zone-center minus 280, clamped to >= 24
+        // below the zone top.
+        let p = VerticalPlacement {
+            fraction: 0.5,
+            offset: -280,
+            min_margin: 24,
+        };
+        // Tall band: 500 - 280 = 220, above the 24 floor.
+        assert_eq!(resolve_vertical_placement(0, 1000, p), 220);
+        // Short band: 150 - 280 = -130 → clamped up to the 24px floor.
+        assert_eq!(resolve_vertical_placement(0, 300, p), 24);
+        // The zone offset is added on top of the (clamped) in-zone position.
+        assert_eq!(resolve_vertical_placement(40, 300, p), 40 + 24);
+    }
+
+    #[test]
+    fn vertical_placement_fraction_from_top() {
+        // All-apps-style: top edge at 12% of the zone height, no offset/floor.
+        let p = VerticalPlacement {
+            fraction: 0.12,
+            offset: 0,
+            min_margin: 0,
+        };
+        assert_eq!(resolve_vertical_placement(0, 1000, p), 120);
+        // Shrinking the zone (a panel appears) raises the surface proportionally.
+        assert!(resolve_vertical_placement(0, 800, p) < resolve_vertical_placement(0, 1000, p));
+    }
+
+    #[test]
+    fn vertical_placement_negative_zone_height_is_safe() {
+        let p = VerticalPlacement {
+            fraction: 0.5,
+            offset: 0,
+            min_margin: 0,
+        };
+        // A degenerate/negative zone height must not panic or go below the zone top.
+        assert_eq!(resolve_vertical_placement(10, -50, p), 10);
+    }
+
+    #[test]
+    fn max_height_caps_to_fraction_with_floor() {
+        // All-apps-style cap: 76% of the zone height.
+        let m = MaxHeight {
+            fraction: 0.76,
+            min_px: 0,
+        };
+        assert_eq!(m.resolve(1000), 760);
+        // A shrinking zone shrinks the cap proportionally.
+        assert_eq!(m.resolve(500), 380);
+        // The floor wins on a tiny zone.
+        let floored = MaxHeight {
+            fraction: 0.76,
+            min_px: 200,
+        };
+        assert_eq!(floored.resolve(100), 200);
+        // Negative/degenerate zone height is safe (floored to min_px).
+        assert_eq!(floored.resolve(-10), 200);
     }
 }
