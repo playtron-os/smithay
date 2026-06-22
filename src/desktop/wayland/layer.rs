@@ -273,34 +273,15 @@ impl LayerMap {
             );
             trace!("Arranging layers into {:?}", output_rect.size);
 
-            // Exclusive surfaces are arranged in two passes: surfaces reserving a
-            // lateral edge (left/right — e.g. full-height side panels) first, then
-            // surfaces reserving a horizontal edge (top/bottom — e.g. bars/docks).
-            // Zone subtraction is progressive, so a surface only avoids zones of
-            // surfaces arranged before it; with mapping order alone a bar mapped
-            // at session start would never yield space to a side panel mapped
-            // (or animated) later. Side panels get the full edge height and bars
-            // shrink horizontally beside them, independent of mapping order.
-            let is_lateral_exclusive = |l: &&LayerSurface| {
-                matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_))
-                    && matches!(
-                        effective_exclusive_edge(&l.cached_state()),
-                        Some(Anchor::LEFT) | Some(Anchor::RIGHT)
-                    )
-            };
-            let lateral_exclusive_surfaces = self.layers.iter().filter(is_lateral_exclusive);
-            let other_exclusive_surfaces = self.layers.iter().filter(|l| {
-                matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_))
-                    && !is_lateral_exclusive(l)
-            });
+            let exclusive_surfaces = self
+                .layers
+                .iter()
+                .filter(|l| matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_)));
             let non_exclusive_surfaces = self
                 .layers
                 .iter()
                 .filter(|l| !matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_)));
-            for layer in lateral_exclusive_surfaces
-                .chain(other_exclusive_surfaces)
-                .chain(non_exclusive_surfaces)
-            {
+            for layer in exclusive_surfaces.chain(non_exclusive_surfaces) {
                 let surface = layer.wl_surface();
 
                 with_surface_tree_downward(
