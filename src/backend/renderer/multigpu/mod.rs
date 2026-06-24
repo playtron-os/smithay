@@ -1734,6 +1734,29 @@ impl MultiTexture {
         })))
     }
 
+    /// Create a `MultiTexture` from a renderer `A`-specific texture type.
+    ///
+    /// The resulting texture contains only and entry for `A` and can thus
+    /// only be successfully rendered from `MultiFrame`s where `R` equals `A`.
+    ///
+    /// Prefer using `ImportDma` or `ImportMem` for function which handle
+    /// returning and caching textures for the current renderer automatically.
+    pub fn from_native_texture<A: GraphicsApi + 'static>(
+        render_id: &ContextId<<<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId>,
+        texture: <<A::Device as ApiDevice>::Renderer as RendererSuper>::TextureId,
+    ) -> Option<MultiTexture> {
+        let mut multi = Self::new(
+            texture.size(),
+            Format {
+                code: texture.format()?,
+                modifier: Modifier::Invalid,
+            },
+        );
+        multi.0.lock().unwrap().format = texture.format();
+        multi.insert_texture::<A>(render_id, texture);
+        Some(multi)
+    }
+
     /// Attempt to get a texture of type `T: Renderer::TextureId` given the renderer type `A` for the given `DrmNode`.
     ///
     /// Will return `None` if either:
@@ -3052,7 +3075,7 @@ where
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SyncPoint, Self::Error> {
         self.flush_frame()?;
         if let Some(target) = self.target.as_mut() {
             let MultiFramebufferInternal::Target(to_fb) = &mut to.0 else {
@@ -3063,8 +3086,7 @@ where
                 .renderer_mut()
                 .blit(target.framebuffer, to_fb, src, dst, filter)
                 .map_err(Error::Target)?;
-            target.device.renderer_mut().wait(&sync).map_err(Error::Target)?;
-            Ok(())
+            Ok(sync)
         } else {
             let MultiFramebufferInternal::Render(to_fb) = &mut to.0 else {
                 unreachable!()
@@ -3092,7 +3114,7 @@ where
         src: Rectangle<i32, Physical>,
         dst: Rectangle<i32, Physical>,
         filter: TextureFilter,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<SyncPoint, Self::Error> {
         self.flush_frame()?;
         if let Some(target) = self.target.as_mut() {
             let MultiFramebufferInternal::Target(from_fb) = &from.0 else {
@@ -3103,8 +3125,7 @@ where
                 .renderer_mut()
                 .blit(from_fb, target.framebuffer, src, dst, filter)
                 .map_err(Error::Target)?;
-            target.device.renderer_mut().wait(&sync).map_err(Error::Target)?;
-            Ok(())
+            Ok(sync)
         } else {
             let MultiFramebufferInternal::Render(from_fb) = &from.0 else {
                 unreachable!()
