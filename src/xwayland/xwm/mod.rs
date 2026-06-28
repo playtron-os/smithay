@@ -245,6 +245,13 @@ mod atoms {
             _NET_STARTUP_ID,
             _GTK_FRAME_EXTENTS,
 
+            // steam / gamescope window markers (read-only, client-set)
+            STEAM_GAME,
+            STEAM_OVERLAY,
+            STEAM_BIGPICTURE,
+            STEAM_INPUT_FOCUS,
+            GAMESCOPE_EXTERNAL_OVERLAY,
+
             // server -> client
             WM_S0,
             WM_STATE,

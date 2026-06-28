@@ -157,6 +157,11 @@ pub(crate) struct SharedSurfaceState {
     instance: String,
     startup_id: Option<String>,
     pid: Option<u32>,
+    steam_game: Option<u32>,
+    steam_overlay: Option<u32>,
+    steam_bigpicture: Option<u32>,
+    steam_input_focus: Option<u32>,
+    external_overlay: Option<u32>,
     protocols: Protocols,
     hints: Option<WmHints>,
     normal_hints: Option<WmSizeHints>,
@@ -290,6 +295,11 @@ pub enum WmWindowProperty {
     StartupId,
     Pid,
     Opacity,
+    SteamGame,
+    SteamOverlay,
+    SteamBigPicture,
+    SteamInputFocus,
+    ExternalOverlay,
     FrameExtents,
 }
 
@@ -362,6 +372,11 @@ impl X11Surface {
                 instance: String::from(""),
                 startup_id: None,
                 pid: None,
+                steam_game: None,
+                steam_overlay: None,
+                steam_bigpicture: None,
+                steam_input_focus: None,
+                external_overlay: None,
                 protocols: Vec::new(),
                 hints: None,
                 normal_hints: None,
@@ -1102,6 +1117,35 @@ impl X11Surface {
         self.state.lock().unwrap().opacity
     }
 
+    /// Returns the Steam appid (`STEAM_GAME` X11 property) of the underlying X11 window, if set
+    pub fn steam_game(&self) -> Option<u32> {
+        self.state.lock().unwrap().steam_game
+    }
+
+    /// Returns the `STEAM_OVERLAY` marker of the underlying X11 window, if set
+    /// (non-zero marks the window as the Steam overlay).
+    pub fn steam_overlay(&self) -> Option<u32> {
+        self.state.lock().unwrap().steam_overlay
+    }
+
+    /// Returns the `STEAM_BIGPICTURE` marker of the underlying X11 window, if set
+    /// (marks the Steam client / Big Picture window).
+    pub fn steam_bigpicture(&self) -> Option<u32> {
+        self.state.lock().unwrap().steam_bigpicture
+    }
+
+    /// Returns the `STEAM_INPUT_FOCUS` mode of the underlying X11 window, if set
+    /// (0 = normal, non-zero = this window grabs input over the game).
+    pub fn steam_input_focus(&self) -> Option<u32> {
+        self.state.lock().unwrap().steam_input_focus
+    }
+
+    /// Returns the `GAMESCOPE_EXTERNAL_OVERLAY` marker of the underlying X11
+    /// window, if set (non-zero marks an external overlay such as MangoHud).
+    pub fn external_overlay(&self) -> Option<u32> {
+        self.state.lock().unwrap().external_overlay
+    }
+
     /// Returns if the window is a modal dialog.
     ///
     /// Corresponds to the `_NET_WM_STATE_MODAL` state of the underlying X11 window.
@@ -1532,6 +1576,11 @@ impl X11Surface {
         self.update_startup_id()?;
         self.update_pid()?;
         self.update_opacity()?;
+        self.update_steam_game()?;
+        self.update_steam_overlay()?;
+        self.update_steam_bigpicture()?;
+        self.update_steam_input_focus()?;
+        self.update_external_overlay()?;
         if let Some(conn) = self.conn.upgrade() {
             let mut state = self.state.lock().unwrap();
             state.opaque_region = fetch_opaque_regions(
@@ -1601,6 +1650,26 @@ impl X11Surface {
             atom if atom == self.atoms._GTK_FRAME_EXTENTS => {
                 self.update_toolkit_frame_extents()?;
                 Ok(Some(WmWindowProperty::FrameExtents))
+            }
+            atom if atom == self.atoms.STEAM_GAME => {
+                self.update_steam_game()?;
+                Ok(Some(WmWindowProperty::SteamGame))
+            }
+            atom if atom == self.atoms.STEAM_OVERLAY => {
+                self.update_steam_overlay()?;
+                Ok(Some(WmWindowProperty::SteamOverlay))
+            }
+            atom if atom == self.atoms.STEAM_BIGPICTURE => {
+                self.update_steam_bigpicture()?;
+                Ok(Some(WmWindowProperty::SteamBigPicture))
+            }
+            atom if atom == self.atoms.STEAM_INPUT_FOCUS => {
+                self.update_steam_input_focus()?;
+                Ok(Some(WmWindowProperty::SteamInputFocus))
+            }
+            atom if atom == self.atoms.GAMESCOPE_EXTERNAL_OVERLAY => {
+                self.update_external_overlay()?;
+                Ok(Some(WmWindowProperty::ExternalOverlay))
             }
 
             _ => Ok(None), // unknown
@@ -1697,6 +1766,42 @@ impl X11Surface {
             let mut state = self.state.lock().unwrap();
             state.opacity = Some(opacity);
         }
+        Ok(())
+    }
+
+    fn update_steam_game(&self) -> Result<(), ConnectionError> {
+        // Assign the read result directly (rather than only-on-Some like the
+        // pid/opacity readers) so that deleting STEAM_GAME clears the cached app
+        // id instead of leaving a stale value that would keep matching.
+        let appid = self.read_window_property_u32(self.atoms.STEAM_GAME)?;
+        self.state.lock().unwrap().steam_game = appid;
+        Ok(())
+    }
+
+    // The Steam/gamescope window-role readers below all use the same direct-assign
+    // (clear-on-delete) pattern as `update_steam_game`: a stale `Some` would wedge
+    // a window as overlay/input-grab forever after the client clears the marker.
+    fn update_steam_overlay(&self) -> Result<(), ConnectionError> {
+        let v = self.read_window_property_u32(self.atoms.STEAM_OVERLAY)?;
+        self.state.lock().unwrap().steam_overlay = v;
+        Ok(())
+    }
+
+    fn update_steam_bigpicture(&self) -> Result<(), ConnectionError> {
+        let v = self.read_window_property_u32(self.atoms.STEAM_BIGPICTURE)?;
+        self.state.lock().unwrap().steam_bigpicture = v;
+        Ok(())
+    }
+
+    fn update_steam_input_focus(&self) -> Result<(), ConnectionError> {
+        let v = self.read_window_property_u32(self.atoms.STEAM_INPUT_FOCUS)?;
+        self.state.lock().unwrap().steam_input_focus = v;
+        Ok(())
+    }
+
+    fn update_external_overlay(&self) -> Result<(), ConnectionError> {
+        let v = self.read_window_property_u32(self.atoms.GAMESCOPE_EXTERNAL_OVERLAY)?;
+        self.state.lock().unwrap().external_overlay = v;
         Ok(())
     }
 
