@@ -318,60 +318,73 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
     _dh: &DisplayHandle,
     surface: &WlSurface,
 ) {
-    if let Some(serial) = compositor::with_states(surface, |states| {
-        states
-            .cached_state
-            .get::<XWaylandShellCachedState>()
-            .pending()
-            .serial
-    }) {
-        if let Some(client) = surface.client() {
-            // We only care about surfaces created by XWayland.
-            if let Some(xwm_id) = client
-                .get_data::<XWaylandClientData>()
-                .and_then(|data| data.user_data().get::<XwmId>())
-            {
-                let xwm = XwmHandler::xwm_state(state, *xwm_id);
+    // Read and immediately clear the pending serial so this hook fires at most once per
+    // surface.  XWaylandShellCachedState::commit() returns *self, so the serial would
+    // otherwise be copied into the next pending state on every commit, causing:
+    //  - repeated failed window lookups for orphaned XWayland surfaces (apps like Zoom
+    //    create hundreds of surfaces tagged to unregistered override-redirect windows),
+    //  - a new destruction hook closure registered on every commit, accumulating millions
+    //    of closures over minutes of video-call usage, causing multi-second stalls when
+    //    those surfaces are eventually destroyed.
+    let Some(serial) = compositor::with_states(surface, |states| {
+        let mut cached = states.cached_state.get::<XWaylandShellCachedState>();
+        let serial = cached.pending().serial?;
+        cached.pending().serial = None;
+        Some(serial)
+    }) else {
+        return;
+    };
 
-                // This handles the case that the serial was set on the X11
-                // window before surface. To handle the other case, we look for
-                // a matching surface when the WL_SURFACE_SERIAL atom is sent.
-                if let Some(window) = xwm.unpaired_surfaces.remove(&serial) {
-                    if let Some(xsurface) = xwm
-                        .windows
-                        .iter()
-                        .find(|x| x.window_id() == window || x.mapped_window_id() == Some(window))
-                        .cloned()
-                    {
-                        debug!(
-                            window = xsurface.window_id(),
-                            wl_surface = ?surface.id().protocol_id(),
-                            "associated X11 window to wl_surface in commit hook",
-                        );
+    let Some(client) = surface.client() else {
+        return;
+    };
+    // We only care about surfaces created by XWayland.
+    let Some(xwm_id) = client
+        .get_data::<XWaylandClientData>()
+        .and_then(|data| data.user_data().get::<XwmId>())
+    else {
+        return;
+    };
 
-                        xsurface.set_wl_surface(state, Some(surface.clone()));
+    let xwm = XwmHandler::xwm_state(state, *xwm_id);
 
-                        XWaylandShellHandler::surface_associated(state, *xwm_id, surface.clone(), xsurface);
-                    } else {
-                        warn!(
-                            window,
-                            wl_surface = ?surface.id().protocol_id(),
-                            "Unknown X11 window associated to wl_surface in commit hook"
-                        )
-                    }
-                } else {
-                    // this is necessary for the atom-handler to look up the matching surface
-                    XWaylandShellHandler::xwayland_shell_state(state)
-                        .by_serial
-                        .insert(serial, surface.clone());
+    // This handles the case that the serial was set on the X11
+    // window before surface. To handle the other case, we look for
+    // a matching surface when the WL_SURFACE_SERIAL atom is sent.
+    if let Some(window) = xwm.unpaired_surfaces.remove(&serial) {
+        if let Some(xsurface) = xwm
+            .windows
+            .iter()
+            .find(|x| x.window_id() == window || x.mapped_window_id() == Some(window))
+            .cloned()
+        {
+            debug!(
+                window = xsurface.window_id(),
+                wl_surface = ?surface.id().protocol_id(),
+                "associated X11 window to wl_surface in commit hook",
+            );
 
-                    compositor::add_destruction_hook::<D, _>(surface, move |state, _| {
-                        XWaylandShellHandler::xwayland_shell_state(state)
-                            .by_serial
-                            .remove(&serial);
-                    });
-                }
-            }
+            xsurface.set_wl_surface(state, Some(surface.clone()));
+
+            XWaylandShellHandler::surface_associated(state, *xwm_id, surface.clone(), xsurface);
+        } else {
+            warn!(
+                window,
+                wl_surface = ?surface.id().protocol_id(),
+                "Unknown X11 window associated to wl_surface in commit hook"
+            );
+        }
+    } else {
+        // this is necessary for the atom-handler to look up the matching surface
+        let shell_state = XWaylandShellHandler::xwayland_shell_state(state);
+        if shell_state.by_serial.insert(serial, surface.clone()).is_none() {
+            // Only register the cleanup hook on the first insertion — the serial is now
+            // cleared from pending state, so subsequent commits won't reach this branch.
+            compositor::add_destruction_hook::<D, _>(surface, move |state, _| {
+                XWaylandShellHandler::xwayland_shell_state(state)
+                    .by_serial
+                    .remove(&serial);
+            });
         }
     }
 }
