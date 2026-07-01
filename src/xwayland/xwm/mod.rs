@@ -1716,8 +1716,14 @@ where
                     // we reparent windows, because a lot of stuff expects, that we do
                     let geo_cookie = conn.get_geometry(r.window)?;
                     let attrs_cookie = conn.get_window_attributes(r.window)?;
-                    let geo = geo_cookie.reply()?;
-                    let attrs = attrs_cookie.reply()?;
+                    let geo = match geo_cookie.reply() {
+                        Ok(g) => g,
+                        Err(_) => { return Ok(()); } // window destroyed before we processed MapRequest
+                    };
+                    let attrs = match attrs_cookie.reply() {
+                        Ok(a) => a,
+                        Err(_) => { return Ok(()); } // window destroyed before we processed MapRequest
+                    };
                     let colormap = xwm.colormap_for_visual(attrs.visual)?;
 
                     let win = r.window;
@@ -2598,7 +2604,16 @@ where
                             let xwm = state.xwm_state(xwm_id);
                             xwm.unpaired_surfaces.insert(serial, xsurface.window_id());
                             std::mem::drop(guard);
-                            xsurface.set_wl_surface(state, None);
+                            // Do NOT call set_wl_surface(state, None) here.  Clearing the
+                            // existing wl_surface creates a None→Some thrash: apps like Zoom
+                            // swap surfaces at 100+ fps via repeated WL_SURFACE_SERIAL messages
+                            // (once per rendered frame).  Removing the old surface each time
+                            // leaves the window momentarily blank and forces hook teardown +
+                            // rebuild on every frame.
+                            //
+                            // Instead, keep the current wl_surface active.  The commit hook
+                            // will call set_wl_surface(Some(new)) when the incoming surface
+                            // commits, cleanly replacing the old one in a single operation.
                         }
                     }
                 }
