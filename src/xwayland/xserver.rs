@@ -148,7 +148,6 @@ impl XWayland {
             .arg(format!(":{display_number}"))
             .arg("-verbose")
             .arg("-rootless")
-            .arg("-terminate")
             .arg("-wm")
             .arg(x_wm_x11.as_raw_fd().to_string())
             .arg("-displayfd")
