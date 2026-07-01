@@ -159,6 +159,7 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 use tracing::{debug, debug_span, info, trace, warn};
 use wayland_server::{DisplayHandle, Resource};
@@ -622,6 +623,13 @@ pub struct X11Wm {
     pub(super) focus_release: FocusReleaseHandle,
 
     span: tracing::Span,
+
+    // Diagnostic rate counters — reset every log interval.
+    diag_event_count: u64,
+    diag_create_count: u64,
+    diag_create_or_count: u64,
+    diag_create_or_props_skipped: u64,
+    diag_last_log: Instant,
 }
 
 impl Drop for X11Wm {
@@ -1048,6 +1056,11 @@ impl X11Wm {
             is_showing_desktop: false,
             focus_release,
             span,
+            diag_event_count: 0,
+            diag_create_count: 0,
+            diag_create_or_count: 0,
+            diag_create_or_props_skipped: 0,
+            diag_last_log: Instant::now(),
         };
 
         let event_handle = handle.clone();
@@ -1541,6 +1554,28 @@ where
         should_ignore = should_ignore,
         "Got X11 event",
     );
+
+    // Diagnostic: count every X11 event and log summary rates every 10 s.
+    xwm.diag_event_count += 1;
+    let elapsed = xwm.diag_last_log.elapsed();
+    if elapsed.as_secs() >= 10 {
+        let secs = elapsed.as_secs_f64();
+        info!(
+            xwm_id = xwm_id.0,
+            events_per_sec = (xwm.diag_event_count as f64 / secs) as u32,
+            creates_per_sec = (xwm.diag_create_count as f64 / secs) as u32,
+            or_creates_per_sec = (xwm.diag_create_or_count as f64 / secs) as u32,
+            or_props_skipped = xwm.diag_create_or_props_skipped,
+            "[DIAG-XWM] X11 event rates over last {:.1}s",
+            secs
+        );
+        xwm.diag_event_count = 0;
+        xwm.diag_create_count = 0;
+        xwm.diag_create_or_count = 0;
+        xwm.diag_create_or_props_skipped = 0;
+        xwm.diag_last_log = Instant::now();
+    }
+
     if should_ignore {
         return Ok(());
     }
@@ -1556,7 +1591,17 @@ where
                 return Ok(());
             }
 
+            let gwa_t0 = Instant::now();
             let attrs = conn.get_window_attributes(n.window)?.reply()?;
+            let gwa_us = gwa_t0.elapsed().as_micros();
+            if gwa_us > 5_000 {
+                info!(
+                    window = n.window,
+                    us = gwa_us,
+                    "[DIAG-XWM] get_window_attributes blocked >{us}µs",
+                    us = gwa_us
+                );
+            }
             if attrs.class != WindowClass::INPUT_OUTPUT {
                 return Ok(());
             }
@@ -1593,7 +1638,32 @@ where
                 geometry,
                 xwm.dnd.xdnd_active.clone(),
             );
-            surface.update_properties()?;
+
+            xwm.diag_create_count += 1;
+            if n.override_redirect {
+                // Override-redirect windows bypass WM management entirely — WM_CLASS,
+                // WM_NAME, hints, etc. are irrelevant for them and we never use those
+                // properties in the compositor. update_properties() makes ~15 sequential
+                // blocking X11 round trips; at high OR creation rates (Zoom creates 70+/s)
+                // this was causing 1000+ blocking calls/s, freezing the event loop.
+                xwm.diag_create_or_count += 1;
+                xwm.diag_create_or_props_skipped += 1;
+                trace!(window = n.window, "[DIAG-XWM] OR window created, skipping update_properties");
+            } else {
+                let props_t0 = Instant::now();
+                surface.update_properties()?;
+                let props_us = props_t0.elapsed().as_micros();
+                if props_us > 5_000 {
+                    info!(
+                        window = n.window,
+                        us = props_us,
+                        "[DIAG-XWM] update_properties blocked {us}µs",
+                        us = props_us
+                    );
+                }
+                trace!(window = n.window, us = props_us, "[DIAG-XWM] managed window created");
+            }
+
             xwm.windows.push(surface.clone());
 
             drop(_guard);
