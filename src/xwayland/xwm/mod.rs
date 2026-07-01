@@ -638,6 +638,7 @@ pub struct X11Wm {
     diag_create_or_count: u64,
     diag_create_or_props_skipped: u64,
     diag_property_count: u64,
+    diag_property_atoms: HashMap<Atom, u64>,
     diag_last_log: Instant,
 }
 
@@ -1088,6 +1089,7 @@ impl X11Wm {
             diag_create_or_count: 0,
             diag_create_or_props_skipped: 0,
             diag_property_count: 0,
+            diag_property_atoms: HashMap::new(),
             diag_last_log: Instant::now(),
         };
 
@@ -1608,6 +1610,15 @@ where
     let elapsed = xwm.diag_last_log.elapsed();
     if elapsed.as_secs() >= 10 {
         let secs = elapsed.as_secs_f64();
+        // Build a sorted top-5 atom breakdown for the property_per_sec counter.
+        let mut top_atoms: Vec<(Atom, u64)> = xwm.diag_property_atoms.iter().map(|(&k, &v)| (k, v)).collect();
+        top_atoms.sort_by(|a, b| b.1.cmp(&a.1));
+        top_atoms.truncate(5);
+        let top_atoms_str = top_atoms
+            .iter()
+            .map(|(atom, count)| format!("{}:{}/s", atom, (*count as f64 / secs) as u32))
+            .collect::<Vec<_>>()
+            .join(" ");
         info!(
             xwm_id = xwm_id.0,
             events_per_sec = (xwm.diag_event_count as f64 / secs) as u32,
@@ -1615,6 +1626,7 @@ where
             or_creates_per_sec = (xwm.diag_create_or_count as f64 / secs) as u32,
             or_props_skipped = xwm.diag_create_or_props_skipped,
             property_per_sec = (xwm.diag_property_count as f64 / secs) as u32,
+            top_property_atoms = %top_atoms_str,
             "[DIAG-XWM] X11 event rates over last {:.1}s",
             secs
         );
@@ -1623,6 +1635,7 @@ where
         xwm.diag_create_or_count = 0;
         xwm.diag_create_or_props_skipped = 0;
         xwm.diag_property_count = 0;
+        xwm.diag_property_atoms.clear();
         xwm.diag_last_log = Instant::now();
     }
 
@@ -2497,6 +2510,7 @@ where
             }
 
             xwm.diag_property_count += 1;
+            *xwm.diag_property_atoms.entry(n.atom).or_insert(0) += 1;
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
                 // Off-load the blocking GetProperty round trip to the property worker thread.
                 // The result arrives back on the main loop via a calloop channel (see start_wm).
@@ -2532,13 +2546,7 @@ where
             }
         }
         Event::ClientMessage(msg) => {
-            if let Some(reply) = conn.get_atom_name(msg.type_)?.reply_unchecked()? {
-                trace!(
-                    event = std::str::from_utf8(&reply.name).unwrap(),
-                    message = ?msg,
-                    "got X11 client event message",
-                );
-            }
+            trace!(atom = msg.type_, message = ?msg, "got X11 client event message");
             match msg.type_ {
                 x if x == xwm.atoms.WL_SURFACE_ID => {
                     let wid = msg.data.as_data32()[0];
@@ -2832,13 +2840,7 @@ where
                         }
 
                         _ => {
-                            debug!(
-                                "Unhandled WM_PROTOCOLS client msg of type {:?}",
-                                String::from_utf8(
-                                    conn.get_atom_name(data[0])?.reply_unchecked()?.unwrap().name
-                                )
-                                .ok()
-                            )
+                            debug!("Unhandled WM_PROTOCOLS client msg of type atom={}", data[0])
                         }
                     }
                 }
@@ -2878,10 +2880,7 @@ where
                     xwm.dnd.handle_drop(msg.data)?;
                 }
                 x => {
-                    debug!(
-                        "Unhandled client msg of type {:?}",
-                        String::from_utf8(conn.get_atom_name(x)?.reply_unchecked()?.unwrap().name).ok()
-                    )
+                    debug!("Unhandled client msg of type atom={}", x)
                 }
             }
         }
