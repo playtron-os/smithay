@@ -173,6 +173,7 @@ use x11rb::{
         composite::{ConnectionExt as _, Redirect},
         randr::{ConnectionExt as _, Notify, NotifyMask},
         render::{ConnectionExt as _, CreatePictureAux, PictureWrapper},
+        shape::{ConnectionExt as ShapeConnectionExt, SK as ShapeKind},
         sync::{ConnectionExt as _, Counter},
         xfixes::ConnectionExt as _,
         xproto::{
@@ -1846,6 +1847,28 @@ where
                 surface.state.lock().unwrap().override_redirect = n.override_redirect;
 
                 if n.override_redirect {
+                    // Subscribe to XShape input-region changes so we know if this OR window
+                    // is click-through (e.g. Zoom's GPU compositor overlay surfaces).
+                    let _ = conn.shape_select_input(n.window, true);
+
+                    // Query the current input shape. Per the XShape spec, an unshaped window
+                    // returns its bounding rect (non-empty), while a window with an explicitly
+                    // empty ShapeInput returns an empty list — meaning it is click-through.
+                    let input_passthrough = conn
+                        .shape_get_rectangles(n.window, ShapeKind::INPUT)
+                        .ok()
+                        .and_then(|cookie| cookie.reply().ok())
+                        .map(|reply| reply.rectangles.is_empty())
+                        .unwrap_or(false);
+
+                    surface.set_input_passthrough(input_passthrough);
+                    if input_passthrough {
+                        trace!(
+                            window = n.window,
+                            "[DIAG-XWM] OR window has empty ShapeInput, marking as click-through"
+                        );
+                    }
+
                     drop(_guard);
                     state.mapped_override_redirect_window(xwm_id, surface);
                 } else {
@@ -2929,6 +2952,30 @@ where
                     surface.handle_sync_timeout();
                     drop(_guard);
                     state.sync_request_timeout(xwm_id, surface);
+                }
+            }
+        }
+        Event::ShapeNotify(n) if n.shape_kind == ShapeKind::INPUT => {
+            // An OR window's input shape changed — update its passthrough flag.
+            // When shaped=true and the input region is empty, the window is click-through.
+            if let Some(surface) = xwm.windows.iter().find(|s| s.window_id() == n.affected_window).cloned() {
+                if surface.is_override_redirect() {
+                    let input_passthrough = if n.shaped {
+                        // Shape is set; query actual rectangles to see if it's empty.
+                        conn.shape_get_rectangles(n.affected_window, ShapeKind::INPUT)
+                            .ok()
+                            .and_then(|cookie| cookie.reply().ok())
+                            .map(|reply| reply.rectangles.is_empty())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    surface.set_input_passthrough(input_passthrough);
+                    trace!(
+                        window = n.affected_window,
+                        input_passthrough,
+                        "[DIAG-XWM] OR window ShapeInput changed"
+                    );
                 }
             }
         }
