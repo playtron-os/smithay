@@ -629,6 +629,7 @@ pub struct X11Wm {
     diag_create_count: u64,
     diag_create_or_count: u64,
     diag_create_or_props_skipped: u64,
+    diag_property_count: u64,
     diag_last_log: Instant,
 }
 
@@ -1060,6 +1061,7 @@ impl X11Wm {
             diag_create_count: 0,
             diag_create_or_count: 0,
             diag_create_or_props_skipped: 0,
+            diag_property_count: 0,
             diag_last_log: Instant::now(),
         };
 
@@ -1566,6 +1568,7 @@ where
             creates_per_sec = (xwm.diag_create_count as f64 / secs) as u32,
             or_creates_per_sec = (xwm.diag_create_or_count as f64 / secs) as u32,
             or_props_skipped = xwm.diag_create_or_props_skipped,
+            property_per_sec = (xwm.diag_property_count as f64 / secs) as u32,
             "[DIAG-XWM] X11 event rates over last {:.1}s",
             secs
         );
@@ -1573,6 +1576,7 @@ where
         xwm.diag_create_count = 0;
         xwm.diag_create_or_count = 0;
         xwm.diag_create_or_props_skipped = 0;
+        xwm.diag_property_count = 0;
         xwm.diag_last_log = Instant::now();
     }
 
@@ -1591,25 +1595,23 @@ where
                 return Ok(());
             }
 
-            let gwa_t0 = Instant::now();
-            let attrs = conn.get_window_attributes(n.window)?.reply()?;
-            let gwa_us = gwa_t0.elapsed().as_micros();
-            if gwa_us > 5_000 {
-                info!(
-                    window = n.window,
-                    us = gwa_us,
-                    "[DIAG-XWM] get_window_attributes blocked >{us}µs",
-                    us = gwa_us
-                );
-            }
-            if attrs.class != WindowClass::INPUT_OUTPUT {
-                return Ok(());
-            }
+            // Skip GetWindowAttributes entirely: the `override_redirect` flag is already
+            // present in the CreateNotify event, and INPUT_ONLY windows are rare enough that
+            // tracking them harmlessly is cheaper than a blocking round trip per creation.
+            // (wlroots also takes this approach — see xwayland/xwm.c:xwm_handle_create_notify.)
 
+            // OR windows bypass WM management, so they do not need PROPERTY_CHANGE events.
+            // Subscribing them would flood the event loop with PropertyNotify (Zoom's Chromium
+            // compositor surfaces update hundreds of properties/sec), each triggering a
+            // blocking GetProperty round trip in the PropertyNotify handler.
+            let event_mask = if n.override_redirect {
+                EventMask::FOCUS_CHANGE
+            } else {
+                EventMask::PROPERTY_CHANGE | EventMask::FOCUS_CHANGE
+            };
             xwm.conn.change_window_attributes(
                 n.window,
-                &ChangeWindowAttributesAux::new()
-                    .event_mask(EventMask::PROPERTY_CHANGE | EventMask::FOCUS_CHANGE),
+                &ChangeWindowAttributesAux::new().event_mask(event_mask),
             )?;
             xwm.conn.flush()?;
 
@@ -2442,8 +2444,20 @@ where
                 }
             }
 
+            xwm.diag_property_count += 1;
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
+                let prop_t0 = Instant::now();
                 if let Some(property) = surface.update_property(n.atom)? {
+                    let prop_us = prop_t0.elapsed().as_micros();
+                    if prop_us > 5_000 {
+                        info!(
+                            window = n.window,
+                            atom = n.atom,
+                            us = prop_us,
+                            "[DIAG-XWM] update_property in PropertyNotify blocked {us}µs",
+                            us = prop_us
+                        );
+                    }
                     drop(_guard);
                     state.property_notify(xwm_id, surface, property);
                 }
