@@ -1847,45 +1847,51 @@ where
                 surface.state.lock().unwrap().override_redirect = n.override_redirect;
 
                 if n.override_redirect {
-                    // Check if this is an InputOnly window (class == 2).
-                    // Chromium's GPU compositor creates InputOnly OR windows as internal
-                    // overlays — they have no visual content but sit on top and eat all
-                    // pointer events. KWin skips these in track() for the same reason.
-                    // We skip calling mapped_override_redirect_window so they never enter
-                    // override_redirect_windows → filter_surface_association rejects them as
-                    // phantom → no Wayland surface, no black window, no input interception.
-                    let window_class = conn
+                    // Get the X11 window attributes to log class and check for INPUT_ONLY.
+                    let attrs = conn
                         .get_window_attributes(n.window)
                         .ok()
-                        .and_then(|c| c.reply().ok())
-                        .map(|r| r.class);
+                        .and_then(|c| c.reply().ok());
+                    let window_class = attrs.as_ref().map(|a| a.class);
+                    let visual = attrs.as_ref().map(|a| a.visual).unwrap_or(0);
 
+                    // Also query geometry to log full context.
+                    let geo = surface.geometry();
+
+                    // Subscribe to XShape input-region changes.
+                    let _ = conn.shape_select_input(n.window, true);
+
+                    // Query the current input shape.
+                    let shape_rects = conn
+                        .shape_get_rectangles(n.window, ShapeKind::INPUT)
+                        .ok()
+                        .and_then(|cookie| cookie.reply().ok())
+                        .map(|reply| reply.rectangles.len())
+                        .unwrap_or(usize::MAX);
+
+                    info!(
+                        window = n.window,
+                        window_class = ?window_class,
+                        visual,
+                        geo_x = geo.loc.x, geo_y = geo.loc.y,
+                        geo_w = geo.size.w, geo_h = geo.size.h,
+                        shape_input_rects = shape_rects,
+                        "[DIAG-XWM] OR window MapNotify"
+                    );
+
+                    // KWin filters InputOnly OR windows before compositing (track()).
+                    // These are transparent input-sink overlays with no visual content.
                     if window_class == Some(WindowClass::INPUT_ONLY) {
                         info!(
                             window = n.window,
-                            "[DIAG-XWM] InputOnly OR window at MapNotify — skipping compositor association"
+                            "[DIAG-XWM] InputOnly OR window — skipping compositor association"
                         );
                         return Ok(());
                     }
 
-                    // Subscribe to XShape input-region changes for non-InputOnly OR windows.
-                    let _ = conn.shape_select_input(n.window, true);
-
-                    // Query the current input shape. An explicitly empty ShapeInput means
-                    // the window is click-through (e.g. transparent Chromium overlay layers).
-                    let input_passthrough = conn
-                        .shape_get_rectangles(n.window, ShapeKind::INPUT)
-                        .ok()
-                        .and_then(|cookie| cookie.reply().ok())
-                        .map(|reply| reply.rectangles.is_empty())
-                        .unwrap_or(false);
-
+                    // Skip OR windows with an empty input shape (click-through overlays).
+                    let input_passthrough = shape_rects == 0;
                     surface.set_input_passthrough(input_passthrough);
-                    trace!(
-                        window = n.window,
-                        input_passthrough,
-                        "[DIAG-XWM] OR window mapped"
-                    );
 
                     drop(_guard);
                     state.mapped_override_redirect_window(xwm_id, surface);
@@ -2635,15 +2641,25 @@ where
                                 .surface_for_serial(serial)
                                 .clone()
                         {
-                            trace!(
-                                window = ?xsurface.window_id(),
-                                wl_surface = ?wl_surface.id().protocol_id(),
-                                "associated X11 window to wl_surface",
-                            );
-
+                            // Guard must be dropped before calling into the compositor so it
+                            // can re-enter xwm_state without deadlocking.
                             std::mem::drop(guard);
-                            xsurface.set_wl_surface(state, Some(wl_surface.clone()));
-                            XWaylandShellHandler::surface_associated(state, xwm_id, wl_surface, xsurface);
+
+                            // Let the compositor veto this association (e.g. unmapped OR windows
+                            // should not be associated until they are mapped).  If rejected, keep
+                            // the entry in by_serial so try_associate_or_surface() can retry.
+                            if XWaylandShellHandler::filter_surface_association(
+                                state, xwm_id, &wl_surface, &xsurface,
+                            ) {
+                                trace!(
+                                    window = ?xsurface.window_id(),
+                                    wl_surface = ?wl_surface.id().protocol_id(),
+                                    "associated X11 window to wl_surface",
+                                );
+
+                                xsurface.set_wl_surface(state, Some(wl_surface.clone()));
+                                XWaylandShellHandler::surface_associated(state, xwm_id, wl_surface, xsurface);
+                            }
                         } else {
                             trace!(
                                 window = ?msg.window,

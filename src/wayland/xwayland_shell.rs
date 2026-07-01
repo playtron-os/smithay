@@ -333,6 +333,44 @@ where
     }
 }
 
+/// Retry associating an override-redirect X11 surface with a pending [`WlSurface`].
+///
+/// Call this from [`XwmHandler::mapped_override_redirect_window`] after adding the window
+/// to the compositor's mapped-OR-window list. If a matching [`WlSurface`] was held in
+/// [`XWaylandShellState`] because a previous association attempt was rejected (e.g. the
+/// window was not yet mapped), and [`XWaylandShellHandler::filter_surface_association`] now
+/// accepts it, the association is completed and [`XWaylandShellHandler::surface_associated`]
+/// is called.
+pub fn try_associate_or_surface<D>(state: &mut D, xwm_id: XwmId, window: &X11Surface)
+where
+    D: XWaylandShellHandler + XwmHandler + SeatHandler + 'static,
+{
+    let Some(serial) = window.wl_surface_serial() else {
+        return;
+    };
+
+    let wl_surface = XWaylandShellHandler::xwayland_shell_state(state)
+        .surface_for_serial(serial)
+        .filter(|s| s.is_alive())
+        .clone();
+
+    let Some(wl_surface) = wl_surface else {
+        return;
+    };
+
+    if !XWaylandShellHandler::filter_surface_association(state, xwm_id, &wl_surface, window) {
+        return;
+    }
+
+    // Remove the pending entry now that we're committing to the association.
+    XWaylandShellHandler::xwayland_shell_state(state)
+        .by_serial
+        .remove(&serial);
+
+    window.set_wl_surface(state, Some(wl_surface.clone()));
+    XWaylandShellHandler::surface_associated(state, xwm_id, wl_surface, window.clone());
+}
+
 fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'static>(
     state: &mut D,
     _dh: &DisplayHandle,
