@@ -1641,27 +1641,16 @@ where
 
             xwm.diag_create_count += 1;
             if n.override_redirect {
-                // Override-redirect windows bypass WM management entirely — WM_CLASS,
-                // WM_NAME, hints, etc. are irrelevant for them and we never use those
-                // properties in the compositor. update_properties() makes ~15 sequential
-                // blocking X11 round trips; at high OR creation rates (Zoom creates 70+/s)
-                // this was causing 1000+ blocking calls/s, freezing the event loop.
+                // Override-redirect windows bypass WM management — properties irrelevant.
                 xwm.diag_create_or_count += 1;
                 xwm.diag_create_or_props_skipped += 1;
                 trace!(window = n.window, "[DIAG-XWM] OR window created, skipping update_properties");
             } else {
-                let props_t0 = Instant::now();
-                surface.update_properties()?;
-                let props_us = props_t0.elapsed().as_micros();
-                if props_us > 5_000 {
-                    info!(
-                        window = n.window,
-                        us = props_us,
-                        "[DIAG-XWM] update_properties blocked {us}µs",
-                        us = props_us
-                    );
-                }
-                trace!(window = n.window, us = props_us, "[DIAG-XWM] managed window created");
+                // Defer update_properties() to MapRequest.  The compositor does not need
+                // WM_CLASS / WM_PROTOCOLS / hints etc. until the window is actually mapped;
+                // fetching them here (15 sequential blocking GetProperty round-trips) stalls
+                // the event loop for 100+ ms while XWayland is at peak load.
+                trace!(window = n.window, "[DIAG-XWM] managed window created, deferring update_properties to MapRequest");
             }
 
             xwm.windows.push(surface.clone());
@@ -1749,6 +1738,25 @@ where
                                 state_lock.net_state.insert(atom);
                             }
                         }
+                    }
+
+                    // Fetch all WM properties before handing the window to the compositor.
+                    // We deferred this from CreateNotify to here because update_properties()
+                    // makes ~15 sequential blocking GetProperty round-trips, which can take
+                    // 100+ ms while XWayland is at peak load during window creation.  At
+                    // MapRequest time the storm is over and responses are typically <5 ms.
+                    let props_t0 = Instant::now();
+                    surface.update_properties()?;
+                    let props_us = props_t0.elapsed().as_micros();
+                    if props_us > 5_000 {
+                        info!(
+                            window = win,
+                            us = props_us,
+                            "[DIAG-XWM] update_properties at MapRequest blocked {us}µs",
+                            us = props_us
+                        );
+                    } else {
+                        trace!(window = win, us = props_us, "[DIAG-XWM] update_properties at MapRequest ok");
                     }
 
                     drop(_guard);
