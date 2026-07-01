@@ -1572,10 +1572,12 @@ where
                 return Ok(());
             }
 
-            let geo = conn.get_geometry(n.window)?.reply()?;
+            // CreateNotify already carries the initial geometry — no need for a
+            // blocking GetGeometry round trip (which is a hot path when apps like
+            // Zoom create windows rapidly and causes main-loop stalls).
             let geometry = Rectangle::<i32, Client>::new(
-                (geo.x as i32, geo.y as i32).into(),
-                (geo.width as i32, geo.height as i32).into(),
+                (n.x as i32, n.y as i32).into(),
+                (n.width as i32, n.height as i32).into(),
             )
             .to_f64()
             .to_logical(xwm.client_scale.load(Ordering::Acquire))

@@ -126,7 +126,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{debug, trace, warn};
+use tracing::{trace, warn};
 use wayland_protocols::xwayland::shell::v1::server::{
     xwayland_shell_v1::{self, XwaylandShellV1},
     xwayland_surface_v1::{self, XwaylandSurfaceV1},
@@ -194,12 +194,32 @@ pub trait XWaylandShellHandler {
     /// Retrieves the global state.
     fn xwayland_shell_state(&mut self) -> &mut XWaylandShellState;
 
+    /// Called before associating a wl_surface with an X11 window. Returning `false`
+    /// prevents the association and stores a [`PhantomXWaylandSurface`] marker on the
+    /// surface so callers can fast-path unmanaged surfaces in the commit handler.
+    ///
+    /// The default implementation accepts all associations.
+    fn filter_surface_association(
+        &mut self,
+        _xwm: XwmId,
+        _wl_surface: &wl_surface::WlSurface,
+        _x11_surface: &X11Surface,
+    ) -> bool {
+        true
+    }
+
     /// An X11 window has been associated with a wayland surface. This doesn't
     /// take effect until the wl_surface is committed.
     fn surface_associated(&mut self, xwm: XwmId, wl_surface: wl_surface::WlSurface, surface: X11Surface) {
         let _ = (xwm, wl_surface, surface);
     }
 }
+
+/// Marker stored in a [`WlSurface`]'s data map by [`XWaylandShellHandler::filter_surface_association`]
+/// when it returns `false`.  Compositors can check for this marker in their commit handler to
+/// skip expensive shell-state scans for phantom override-redirect XWayland surfaces.
+#[derive(Debug, Default)]
+pub struct PhantomXWaylandSurface;
 
 /// Represents a pending X11 serial, used to associate X11 windows with wayland
 /// surfaces.
@@ -358,6 +378,15 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
             .find(|x| x.window_id() == window || x.mapped_window_id() == Some(window))
             .cloned()
         {
+            if !XWaylandShellHandler::filter_surface_association(state, *xwm_id, surface, &xsurface) {
+                // Compositor rejected this association (e.g. unmapped override-redirect phantom).
+                // Mark the surface so the commit handler can fast-path past expensive shell scans.
+                compositor::with_states(surface, |states| {
+                    states.data_map.insert_if_missing(PhantomXWaylandSurface::default);
+                });
+                return;
+            }
+
             trace!(
                 window = xsurface.window_id(),
                 wl_surface = ?surface.id().protocol_id(),
