@@ -176,7 +176,7 @@ use x11rb::{
         sync::{ConnectionExt as _, Counter},
         xfixes::ConnectionExt as _,
         xproto::{
-            AtomEnum, CONFIGURE_NOTIFY_EVENT, ChangeWindowAttributesAux, Colormap, ColormapAlloc,
+            Atom, AtomEnum, CONFIGURE_NOTIFY_EVENT, ChangeWindowAttributesAux, Colormap, ColormapAlloc,
             ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux,
             CreateWindowAux, CursorWrapper, EventMask, FontWrapper, GcontextWrapper, ImageFormat, InputFocus,
             NotifyDetail, PixmapWrapper, PropMode, Property, QueryExtensionReply, Screen, StackMode,
@@ -624,6 +624,14 @@ pub struct X11Wm {
 
     span: tracing::Span,
 
+    // Async property fetch: PropertyNotify events are forwarded to a background
+    // thread via prop_work_tx so the main calloop thread never blocks on GetProperty.
+    // Results come back through a calloop channel registered in start_wm().
+    // prop_work_tx must be declared BEFORE _prop_worker so it is dropped first
+    // (closing the channel causes the worker to exit, then the JoinHandle can join).
+    prop_work_tx: std::sync::mpsc::SyncSender<(X11Surface, Atom)>,
+    _prop_worker: std::thread::JoinHandle<()>,
+
     // Diagnostic rate counters — reset every log interval.
     diag_event_count: u64,
     diag_create_count: u64,
@@ -1033,6 +1041,22 @@ impl X11Wm {
             handle.insert_source(focus_release_source, move |_, _, _| release.dispatch())?;
         }
 
+        // Spin up the async property fetch worker.  PropertyNotify events are forwarded
+        // to this thread so blocking GetProperty round trips never stall the compositor.
+        let (prop_work_tx, prop_work_rx) =
+            std::sync::mpsc::sync_channel::<(X11Surface, Atom)>(512);
+        let (prop_result_tx, prop_result_channel) =
+            calloop::channel::channel::<(X11Surface, WmWindowProperty)>();
+        let _prop_worker = std::thread::Builder::new()
+            .name("xwm-prop-fetch".into())
+            .spawn(move || prop_fetch_worker(prop_work_rx, prop_result_tx))
+            .map_err(|e| format!("failed to spawn xwm property fetch thread: {e}"))?;
+        handle.insert_source(prop_result_channel, move |event, _, data: &mut D| {
+            if let calloop::channel::Event::Msg((surface, prop)) = event {
+                data.property_notify(id, surface, prop);
+            }
+        })?;
+
         drop(_guard);
         let wm = Self {
             id,
@@ -1057,6 +1081,8 @@ impl X11Wm {
             is_showing_desktop: false,
             focus_release,
             span,
+            prop_work_tx,
+            _prop_worker,
             diag_event_count: 0,
             diag_create_count: 0,
             diag_create_or_count: 0,
@@ -1510,6 +1536,26 @@ impl X11Wm {
                 .check()?;
             self.colormaps.borrow_mut().insert(visual, colormap);
             Ok(colormap)
+        }
+    }
+}
+
+/// Background worker: receives (surface, atom) pairs, calls the blocking
+/// `update_property()` (one GetProperty round trip each), then sends the
+/// result back to the main loop via a calloop channel.  Running this off
+/// the compositor thread means PropertyNotify events never block rendering.
+fn prop_fetch_worker(
+    rx: std::sync::mpsc::Receiver<(X11Surface, Atom)>,
+    tx: calloop::channel::Sender<(X11Surface, WmWindowProperty)>,
+) {
+    while let Ok((surface, atom)) = rx.recv() {
+        match surface.update_property(atom) {
+            Ok(Some(prop)) => {
+                if tx.send((surface, prop)).is_err() {
+                    break; // result channel closed — compositor shutting down
+                }
+            }
+            Ok(None) | Err(_) => {} // unknown atom or window already gone
         }
     }
 }
@@ -2446,20 +2492,14 @@ where
 
             xwm.diag_property_count += 1;
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
-                let prop_t0 = Instant::now();
-                if let Some(property) = surface.update_property(n.atom)? {
-                    let prop_us = prop_t0.elapsed().as_micros();
-                    if prop_us > 5_000 {
-                        info!(
-                            window = n.window,
-                            atom = n.atom,
-                            us = prop_us,
-                            "[DIAG-XWM] update_property in PropertyNotify blocked {us}µs",
-                            us = prop_us
-                        );
-                    }
-                    drop(_guard);
-                    state.property_notify(xwm_id, surface, property);
+                // Off-load the blocking GetProperty round trip to the property worker thread.
+                // The result arrives back on the main loop via a calloop channel (see start_wm).
+                if xwm.prop_work_tx.try_send((surface, n.atom)).is_err() {
+                    warn!(
+                        window = n.window,
+                        atom = n.atom,
+                        "[XWM] property fetch queue full, dropping PropertyNotify"
+                    );
                 }
             }
         }
