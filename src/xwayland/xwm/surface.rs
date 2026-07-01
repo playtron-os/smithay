@@ -634,6 +634,60 @@ impl X11Surface {
         }
     }
 
+    /// Like [`configure_with_sync`](Self::configure_with_sync) but always sends a sync request
+    /// even when the geometry size hasn't changed.
+    ///
+    /// Use this for the initial map of a window to gate first-frame rendering: the client will
+    /// signal via `_NET_WM_SYNC_REQUEST` when it has finished painting its first frame, and
+    /// [`XwmHandler::sync_request_acked`](super::XwmHandler::sync_request_acked) will fire.
+    /// Falls back to a plain configure if the client doesn't support the sync protocol.
+    pub fn configure_with_forced_sync(
+        &self,
+        rect: impl Into<Rectangle<i32, Logical>>,
+        timeout: Option<Duration>,
+    ) -> Result<(), X11SurfaceError> {
+        if self.is_override_redirect() {
+            return Err(X11SurfaceError::UnsupportedForOverrideRedirect);
+        }
+        let rect = rect.into();
+        let mut state = self.state.lock().unwrap();
+        // Unlike configure_with_sync, we skip the "same size → no sync" optimization.
+        // At initial map the client hasn't rendered yet so it will always respond.
+        match self.send_sync_request(&mut state, timeout.unwrap_or(DEFAULT_SYNC_REQUEST_TIMEOUT)) {
+            Err(SyncRequestError::NotSupported) => {
+                drop(state);
+                self.configure(rect)
+            }
+            Err(SyncRequestError::RequestPending) => {
+                state.buffered_configure = Some(rect);
+                Ok(())
+            }
+            Ok(_) => match self.send_configure(&mut state, rect) {
+                Err(err) => {
+                    self.finish_pending_sync(&mut state);
+                    Err(err)
+                }
+                Ok(pending_configure) => {
+                    state.pending_configure = Some(pending_configure);
+                    state.buffered_configure = None;
+                    Ok(())
+                }
+            },
+            Err(SyncRequestError::IdsExhausted) => {
+                self.set_allow_commits(&state, true);
+                Err(ConnectionError::UnknownError.into())
+            }
+            Err(SyncRequestError::Connection(err)) => {
+                self.set_allow_commits(&state, true);
+                Err(err.into())
+            }
+            Err(SyncRequestError::X11(err)) => {
+                self.set_allow_commits(&state, true);
+                Err(err.into())
+            }
+        }
+    }
+
     /// Sends a sync request to the client.
     ///
     /// This increments a counter used in the `_NET_WM_SYNC_REQUEST` protocol and sends a client
