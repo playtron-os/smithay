@@ -131,6 +131,9 @@ pub(crate) struct SharedSurfaceState {
     pub(super) mapped_onto: Option<X11Window>,
     pub(super) last_configure: Rectangle<i32, Logical>,
     pub(super) override_redirect: bool,
+    /// True for X11 windows with class `InputOnly` — these have no visual content
+    /// and must not intercept Wayland pointer events.
+    pub(super) input_only: bool,
     /// True when the X11 window has an empty ShapeInput region (click-through).
     pub(super) input_passthrough: bool,
 
@@ -369,6 +372,7 @@ impl X11Surface {
                 mapped_onto: None,
                 last_configure: geometry,
                 override_redirect,
+                input_only: false,
                 input_passthrough: false,
                 title: String::from(""),
                 class: String::from(""),
@@ -454,6 +458,11 @@ impl X11Surface {
     /// Returns if this window has the override redirect flag set or not
     pub fn is_override_redirect(&self) -> bool {
         self.state.lock().unwrap().override_redirect
+    }
+
+    /// Returns true if this X11 window has class `InputOnly` (no visual content).
+    pub fn is_input_only(&self) -> bool {
+        self.state.lock().unwrap().input_only
     }
 
     /// Sets whether this surface has an empty X11 ShapeInput region (click-through).
@@ -2331,8 +2340,11 @@ impl X11Surface {
         if self.xdnd_active.load(Ordering::Acquire) && self.is_override_redirect() {
             return None;
         }
-        if self.state.lock().unwrap().input_passthrough {
-            return None;
+        {
+            let state = self.state.lock().unwrap();
+            if state.input_only || state.input_passthrough {
+                return None;
+            }
         }
         if let Some(surface) = X11Surface::wl_surface(self).as_ref() {
             return under_from_surface_tree(surface, point, location, surface_type);

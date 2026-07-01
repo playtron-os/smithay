@@ -1847,13 +1847,32 @@ where
                 surface.state.lock().unwrap().override_redirect = n.override_redirect;
 
                 if n.override_redirect {
-                    // Subscribe to XShape input-region changes so we know if this OR window
-                    // is click-through (e.g. Zoom's GPU compositor overlay surfaces).
+                    // Check if this is an InputOnly window (class == 2).
+                    // Chromium's GPU compositor creates InputOnly OR windows as internal
+                    // overlays — they have no visual content but sit on top and eat all
+                    // pointer events. KWin skips these in track() for the same reason.
+                    // We skip calling mapped_override_redirect_window so they never enter
+                    // override_redirect_windows → filter_surface_association rejects them as
+                    // phantom → no Wayland surface, no black window, no input interception.
+                    let window_class = conn
+                        .get_window_attributes(n.window)
+                        .ok()
+                        .and_then(|c| c.reply().ok())
+                        .map(|r| r.class);
+
+                    if window_class == Some(WindowClass::INPUT_ONLY) {
+                        info!(
+                            window = n.window,
+                            "[DIAG-XWM] InputOnly OR window at MapNotify — skipping compositor association"
+                        );
+                        return Ok(());
+                    }
+
+                    // Subscribe to XShape input-region changes for non-InputOnly OR windows.
                     let _ = conn.shape_select_input(n.window, true);
 
-                    // Query the current input shape. Per the XShape spec, an unshaped window
-                    // returns its bounding rect (non-empty), while a window with an explicitly
-                    // empty ShapeInput returns an empty list — meaning it is click-through.
+                    // Query the current input shape. An explicitly empty ShapeInput means
+                    // the window is click-through (e.g. transparent Chromium overlay layers).
                     let input_passthrough = conn
                         .shape_get_rectangles(n.window, ShapeKind::INPUT)
                         .ok()
@@ -1862,12 +1881,11 @@ where
                         .unwrap_or(false);
 
                     surface.set_input_passthrough(input_passthrough);
-                    if input_passthrough {
-                        trace!(
-                            window = n.window,
-                            "[DIAG-XWM] OR window has empty ShapeInput, marking as click-through"
-                        );
-                    }
+                    trace!(
+                        window = n.window,
+                        input_passthrough,
+                        "[DIAG-XWM] OR window mapped"
+                    );
 
                     drop(_guard);
                     state.mapped_override_redirect_window(xwm_id, surface);
