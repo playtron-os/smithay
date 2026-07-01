@@ -2024,6 +2024,32 @@ where
         }
         Event::UnmapNotify(n) => {
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
+                // For managed windows, check if this is a duplicate unmap: the frame was
+                // already destroyed and the window is no longer in the client list.
+                // Chromium-based apps (e.g. Zoom) can send hundreds of XUnmapWindow calls
+                // (or ICCCM synthetic UnmapNotify events) per second during startup; without
+                // this guard each one triggers grab_server + reparent_window + schedule_render.
+                if !surface.is_override_redirect() {
+                    let mapped_onto = surface.state.lock().unwrap().mapped_onto;
+                    let in_client_list = xwm.client_list.contains(&surface.window_id());
+                    info!(
+                        window = n.window,
+                        event = n.event,
+                        from_configure = n.from_configure,
+                        send_event = (n.response_type & 0x80) != 0,
+                        sequence = n.sequence,
+                        mapped_onto = ?mapped_onto,
+                        in_client_list,
+                        "[DIAG-XWM] UnmapNotify managed window",
+                    );
+                    if mapped_onto.is_none() && !in_client_list {
+                        // Already unmapped — nothing to tear down, no need to notify compositor again.
+                        // Drop the tracing span guard before taking &mut state (NLL: last use of xwm).
+                        drop(_guard);
+                        surface.set_wl_surface(state, None);
+                        return Ok(());
+                    }
+                }
                 xwm.client_list.retain(|w| *w != surface.window_id());
                 xwm.client_list_stacking.retain(|w| *w != surface.window_id());
                 {
