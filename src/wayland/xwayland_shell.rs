@@ -126,7 +126,7 @@
 
 use std::collections::HashMap;
 
-use tracing::{debug, warn};
+use tracing::{debug, trace, warn};
 use wayland_protocols::xwayland::shell::v1::server::{
     xwayland_shell_v1::{self, XwaylandShellV1},
     xwayland_surface_v1::{self, XwaylandSurfaceV1},
@@ -358,7 +358,7 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
             .find(|x| x.window_id() == window || x.mapped_window_id() == Some(window))
             .cloned()
         {
-            debug!(
+            trace!(
                 window = xsurface.window_id(),
                 wl_surface = ?surface.id().protocol_id(),
                 "associated X11 window to wl_surface in commit hook",

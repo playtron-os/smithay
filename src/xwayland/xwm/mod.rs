@@ -2446,7 +2446,7 @@ where
                                 .surface_for_serial(serial)
                                 .clone()
                         {
-                            debug!(
+                            trace!(
                                 window = ?xsurface.window_id(),
                                 wl_surface = ?wl_surface.id().protocol_id(),
                                 "associated X11 window to wl_surface",
@@ -2456,7 +2456,7 @@ where
                             xsurface.set_wl_surface(state, Some(wl_surface.clone()));
                             XWaylandShellHandler::surface_associated(state, xwm_id, wl_surface, xsurface);
                         } else {
-                            debug!(
+                            trace!(
                                 window = ?msg.window,
                                 serial = serial,
                                 "no matching wl_surface for X11 window",
