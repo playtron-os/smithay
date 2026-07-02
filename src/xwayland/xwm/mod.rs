@@ -159,7 +159,6 @@ use std::{
         Arc, Weak,
         atomic::{AtomicBool, Ordering},
     },
-    time::Instant,
 };
 use tracing::{debug, debug_span, info, trace, warn};
 use wayland_server::{DisplayHandle, Resource};
@@ -632,15 +631,6 @@ pub struct X11Wm {
     // (closing the channel causes the worker to exit, then the JoinHandle can join).
     prop_work_tx: std::sync::mpsc::SyncSender<(X11Surface, Atom)>,
     _prop_worker: std::thread::JoinHandle<()>,
-
-    // Diagnostic rate counters — reset every log interval.
-    diag_event_count: u64,
-    diag_create_count: u64,
-    diag_create_or_count: u64,
-    diag_create_or_props_skipped: u64,
-    diag_property_count: u64,
-    diag_property_atoms: HashMap<Atom, u64>,
-    diag_last_log: Instant,
 }
 
 impl Drop for X11Wm {
@@ -1045,8 +1035,7 @@ impl X11Wm {
 
         // Spin up the async property fetch worker.  PropertyNotify events are forwarded
         // to this thread so blocking GetProperty round trips never stall the compositor.
-        let (prop_work_tx, prop_work_rx) =
-            std::sync::mpsc::sync_channel::<(X11Surface, Atom)>(512);
+        let (prop_work_tx, prop_work_rx) = std::sync::mpsc::sync_channel::<(X11Surface, Atom)>(512);
         let (prop_result_tx, prop_result_channel) =
             calloop::channel::channel::<(X11Surface, WmWindowProperty)>();
         let _prop_worker = std::thread::Builder::new()
@@ -1085,13 +1074,6 @@ impl X11Wm {
             span,
             prop_work_tx,
             _prop_worker,
-            diag_event_count: 0,
-            diag_create_count: 0,
-            diag_create_or_count: 0,
-            diag_create_or_props_skipped: 0,
-            diag_property_count: 0,
-            diag_property_atoms: HashMap::new(),
-            diag_last_log: Instant::now(),
         };
 
         let event_handle = handle.clone();
@@ -1606,40 +1588,6 @@ where
         "Got X11 event",
     );
 
-    // Diagnostic: count every X11 event and log summary rates every 10 s.
-    xwm.diag_event_count += 1;
-    let elapsed = xwm.diag_last_log.elapsed();
-    if elapsed.as_secs() >= 10 {
-        let secs = elapsed.as_secs_f64();
-        // Build a sorted top-5 atom breakdown for the property_per_sec counter.
-        let mut top_atoms: Vec<(Atom, u64)> = xwm.diag_property_atoms.iter().map(|(&k, &v)| (k, v)).collect();
-        top_atoms.sort_by(|a, b| b.1.cmp(&a.1));
-        top_atoms.truncate(5);
-        let top_atoms_str = top_atoms
-            .iter()
-            .map(|(atom, count)| format!("{}:{}/s", atom, (*count as f64 / secs) as u32))
-            .collect::<Vec<_>>()
-            .join(" ");
-        info!(
-            xwm_id = xwm_id.0,
-            events_per_sec = (xwm.diag_event_count as f64 / secs) as u32,
-            creates_per_sec = (xwm.diag_create_count as f64 / secs) as u32,
-            or_creates_per_sec = (xwm.diag_create_or_count as f64 / secs) as u32,
-            or_props_skipped = xwm.diag_create_or_props_skipped,
-            property_per_sec = (xwm.diag_property_count as f64 / secs) as u32,
-            top_property_atoms = %top_atoms_str,
-            "[DIAG-XWM] X11 event rates over last {:.1}s",
-            secs
-        );
-        xwm.diag_event_count = 0;
-        xwm.diag_create_count = 0;
-        xwm.diag_create_or_count = 0;
-        xwm.diag_create_or_props_skipped = 0;
-        xwm.diag_property_count = 0;
-        xwm.diag_property_atoms.clear();
-        xwm.diag_last_log = Instant::now();
-    }
-
     if should_ignore {
         return Ok(());
     }
@@ -1701,20 +1649,6 @@ where
                 xwm.dnd.xdnd_active.clone(),
             );
 
-            xwm.diag_create_count += 1;
-            if n.override_redirect {
-                // Override-redirect windows bypass WM management — properties irrelevant.
-                xwm.diag_create_or_count += 1;
-                xwm.diag_create_or_props_skipped += 1;
-                trace!(window = n.window, "[DIAG-XWM] OR window created, skipping update_properties");
-            } else {
-                // Defer update_properties() to MapRequest.  The compositor does not need
-                // WM_CLASS / WM_PROTOCOLS / hints etc. until the window is actually mapped;
-                // fetching them here (15 sequential blocking GetProperty round-trips) stalls
-                // the event loop for 100+ ms while XWayland is at peak load.
-                trace!(window = n.window, "[DIAG-XWM] managed window created, deferring update_properties to MapRequest");
-            }
-
             xwm.windows.push(surface.clone());
 
             drop(_guard);
@@ -1732,11 +1666,15 @@ where
                     let attrs_cookie = conn.get_window_attributes(r.window)?;
                     let geo = match geo_cookie.reply() {
                         Ok(g) => g,
-                        Err(_) => { return Ok(()); } // window destroyed before we processed MapRequest
+                        Err(_) => {
+                            return Ok(());
+                        } // window destroyed before we processed MapRequest
                     };
                     let attrs = match attrs_cookie.reply() {
                         Ok(a) => a,
-                        Err(_) => { return Ok(()); } // window destroyed before we processed MapRequest
+                        Err(_) => {
+                            return Ok(());
+                        } // window destroyed before we processed MapRequest
                     };
                     let colormap = xwm.colormap_for_visual(attrs.visual)?;
 
@@ -1813,19 +1751,7 @@ where
                     // makes ~15 sequential blocking GetProperty round-trips, which can take
                     // 100+ ms while XWayland is at peak load during window creation.  At
                     // MapRequest time the storm is over and responses are typically <5 ms.
-                    let props_t0 = Instant::now();
                     surface.update_properties()?;
-                    let props_us = props_t0.elapsed().as_micros();
-                    if props_us > 5_000 {
-                        info!(
-                            window = win,
-                            us = props_us,
-                            "[DIAG-XWM] update_properties at MapRequest blocked {us}µs",
-                            us = props_us
-                        );
-                    } else {
-                        trace!(window = win, us = props_us, "[DIAG-XWM] update_properties at MapRequest ok");
-                    }
 
                     drop(_guard);
                     state.map_window_request(xwm_id, surface);
@@ -1853,10 +1779,6 @@ where
                         .ok()
                         .and_then(|c| c.reply().ok());
                     let window_class = attrs.as_ref().map(|a| a.class);
-                    let visual = attrs.as_ref().map(|a| a.visual).unwrap_or(0);
-
-                    // Also query geometry to log full context.
-                    let geo = surface.geometry();
 
                     // Subscribe to XShape input-region changes.
                     let _ = conn.shape_select_input(n.window, true);
@@ -1869,23 +1791,9 @@ where
                         .map(|reply| reply.rectangles.len())
                         .unwrap_or(usize::MAX);
 
-                    info!(
-                        window = n.window,
-                        window_class = ?window_class,
-                        visual,
-                        geo_x = geo.loc.x, geo_y = geo.loc.y,
-                        geo_w = geo.size.w, geo_h = geo.size.h,
-                        shape_input_rects = shape_rects,
-                        "[DIAG-XWM] OR window MapNotify"
-                    );
-
                     // KWin filters InputOnly OR windows before compositing (track()).
                     // These are transparent input-sink overlays with no visual content.
                     if window_class == Some(WindowClass::INPUT_ONLY) {
-                        info!(
-                            window = n.window,
-                            "[DIAG-XWM] InputOnly OR window — skipping compositor association"
-                        );
                         return Ok(());
                     }
 
@@ -2032,16 +1940,6 @@ where
                 if !surface.is_override_redirect() {
                     let mapped_onto = surface.state.lock().unwrap().mapped_onto;
                     let in_client_list = xwm.client_list.contains(&surface.window_id());
-                    info!(
-                        window = n.window,
-                        event = n.event,
-                        from_configure = n.from_configure,
-                        send_event = (n.response_type & 0x80) != 0,
-                        sequence = n.sequence,
-                        mapped_onto = ?mapped_onto,
-                        in_client_list,
-                        "[DIAG-XWM] UnmapNotify managed window",
-                    );
                     if mapped_onto.is_none() && !in_client_list {
                         // Already unmapped — nothing to tear down, no need to notify compositor again.
                         // Drop the tracing span guard before taking &mut state (NLL: last use of xwm).
@@ -2582,8 +2480,6 @@ where
                 }
             }
 
-            xwm.diag_property_count += 1;
-            *xwm.diag_property_atoms.entry(n.atom).or_insert(0) += 1;
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
                 // Off-load the blocking GetProperty round trip to the property worker thread.
                 // The result arrives back on the main loop via a calloop channel (see start_wm).
@@ -2675,7 +2571,10 @@ where
                             // should not be associated until they are mapped).  If rejected, keep
                             // the entry in by_serial so try_associate_or_surface() can retry.
                             if XWaylandShellHandler::filter_surface_association(
-                                state, xwm_id, &wl_surface, &xsurface,
+                                state,
+                                xwm_id,
+                                &wl_surface,
+                                &xsurface,
                             ) {
                                 trace!(
                                     window = ?xsurface.window_id(),
@@ -3018,7 +2917,12 @@ where
         Event::ShapeNotify(n) if n.shape_kind == ShapeKind::INPUT => {
             // An OR window's input shape changed — update its passthrough flag.
             // When shaped=true and the input region is empty, the window is click-through.
-            if let Some(surface) = xwm.windows.iter().find(|s| s.window_id() == n.affected_window).cloned() {
+            if let Some(surface) = xwm
+                .windows
+                .iter()
+                .find(|s| s.window_id() == n.affected_window)
+                .cloned()
+            {
                 if surface.is_override_redirect() {
                     let input_passthrough = if n.shaped {
                         // Shape is set; query actual rectangles to see if it's empty.
@@ -3031,11 +2935,6 @@ where
                         false
                     };
                     surface.set_input_passthrough(input_passthrough);
-                    trace!(
-                        window = n.affected_window,
-                        input_passthrough,
-                        "[DIAG-XWM] OR window ShapeInput changed"
-                    );
                 }
             }
         }
