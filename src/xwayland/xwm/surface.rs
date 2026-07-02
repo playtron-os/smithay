@@ -1665,7 +1665,7 @@ impl X11Surface {
         let ck_steam_ovly = conn.get_property(false, win, atoms.STEAM_OVERLAY, AtomEnum::CARDINAL, 0, 1)?;
         let ck_steam_bigp =
             conn.get_property(false, win, atoms.STEAM_BIGPICTURE, AtomEnum::CARDINAL, 0, 1)?;
-        let ck_steam_inpt =
+        let ck_steam_input =
             conn.get_property(false, win, atoms.STEAM_INPUT_FOCUS, AtomEnum::CARDINAL, 0, 1)?;
         let ck_ext_ovly = conn.get_property(
             false,
@@ -1773,7 +1773,7 @@ impl X11Surface {
         let steam_game = read_u32(ck_steam_game.reply_unchecked())?;
         let steam_ovly = read_u32(ck_steam_ovly.reply_unchecked())?;
         let steam_bigp = read_u32(ck_steam_bigp.reply_unchecked())?;
-        let steam_inpt = read_u32(ck_steam_inpt.reply_unchecked())?;
+        let steam_input = read_u32(ck_steam_input.reply_unchecked())?;
         let ext_ovly = read_u32(ck_ext_ovly.reply_unchecked())?;
 
         // _NET_WM_OPAQUE_REGION
@@ -1846,7 +1846,7 @@ impl X11Surface {
             state.steam_game = steam_game;
             state.steam_overlay = steam_ovly;
             state.steam_bigpicture = steam_bigp;
-            state.steam_input_focus = steam_inpt;
+            state.steam_input_focus = steam_input;
             state.external_overlay = ext_ovly;
             state.opaque_region = opaque_region;
             state.opaque_region_dirty = false;
