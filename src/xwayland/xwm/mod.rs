@@ -172,10 +172,11 @@ use x11rb::{
         composite::{ConnectionExt as _, Redirect},
         randr::{ConnectionExt as _, Notify, NotifyMask},
         render::{ConnectionExt as _, CreatePictureAux, PictureWrapper},
+        shape::{ConnectionExt as ShapeConnectionExt, SK as ShapeKind},
         sync::{ConnectionExt as _, Counter},
         xfixes::ConnectionExt as _,
         xproto::{
-            AtomEnum, CONFIGURE_NOTIFY_EVENT, ChangeWindowAttributesAux, Colormap, ColormapAlloc,
+            Atom, AtomEnum, CONFIGURE_NOTIFY_EVENT, ChangeWindowAttributesAux, Colormap, ColormapAlloc,
             ConfigWindow, ConfigureNotifyEvent, ConfigureWindowAux, ConnectionExt, CreateGCAux,
             CreateWindowAux, CursorWrapper, EventMask, FontWrapper, GcontextWrapper, ImageFormat, InputFocus,
             NotifyDetail, PixmapWrapper, PropMode, Property, QueryExtensionReply, Screen, StackMode,
@@ -622,6 +623,14 @@ pub struct X11Wm {
     pub(super) focus_release: FocusReleaseHandle,
 
     span: tracing::Span,
+
+    // Async property fetch: PropertyNotify events are forwarded to a background
+    // thread via prop_work_tx so the main calloop thread never blocks on GetProperty.
+    // Results come back through a calloop channel registered in start_wm().
+    // prop_work_tx must be declared BEFORE _prop_worker so it is dropped first
+    // (closing the channel causes the worker to exit, then the JoinHandle can join).
+    prop_work_tx: std::sync::mpsc::SyncSender<(X11Surface, Atom)>,
+    _prop_worker: std::thread::JoinHandle<()>,
 }
 
 impl Drop for X11Wm {
@@ -1024,6 +1033,21 @@ impl X11Wm {
             handle.insert_source(focus_release_source, move |_, _, _| release.dispatch())?;
         }
 
+        // Spin up the async property fetch worker.  PropertyNotify events are forwarded
+        // to this thread so blocking GetProperty round trips never stall the compositor.
+        let (prop_work_tx, prop_work_rx) = std::sync::mpsc::sync_channel::<(X11Surface, Atom)>(512);
+        let (prop_result_tx, prop_result_channel) =
+            calloop::channel::channel::<(X11Surface, WmWindowProperty)>();
+        let _prop_worker = std::thread::Builder::new()
+            .name("xwm-prop-fetch".into())
+            .spawn(move || prop_fetch_worker(prop_work_rx, prop_result_tx))
+            .map_err(|e| format!("failed to spawn xwm property fetch thread: {e}"))?;
+        handle.insert_source(prop_result_channel, move |event, _, data: &mut D| {
+            if let calloop::channel::Event::Msg((surface, prop)) = event {
+                data.property_notify(id, surface, prop);
+            }
+        })?;
+
         drop(_guard);
         let wm = Self {
             id,
@@ -1048,6 +1072,8 @@ impl X11Wm {
             is_showing_desktop: false,
             focus_release,
             span,
+            prop_work_tx,
+            _prop_worker,
         };
 
         let event_handle = handle.clone();
@@ -1499,6 +1525,23 @@ impl X11Wm {
     }
 }
 
+/// Background worker: receives (surface, atom) pairs, calls the blocking
+/// `update_property()` (one GetProperty round trip each), then sends the
+/// result back to the main loop via a calloop channel.  Running this off
+/// the compositor thread means PropertyNotify events never block rendering.
+fn prop_fetch_worker(
+    rx: std::sync::mpsc::Receiver<(X11Surface, Atom)>,
+    tx: calloop::channel::Sender<(X11Surface, WmWindowProperty)>,
+) {
+    while let Ok((surface, atom)) = rx.recv() {
+        if let Ok(Some(prop)) = surface.update_property(atom) {
+            if tx.send((surface, prop)).is_err() {
+                break; // result channel closed — compositor shutting down
+            }
+        }
+    }
+}
+
 fn handle_event<D>(
     loop_handle: &LoopHandle<'_, D>,
     dh: &DisplayHandle,
@@ -1541,6 +1584,7 @@ where
         should_ignore = should_ignore,
         "Got X11 event",
     );
+
     if should_ignore {
         return Ok(());
     }
@@ -1556,15 +1600,23 @@ where
                 return Ok(());
             }
 
-            let attrs = conn.get_window_attributes(n.window)?.reply()?;
-            if attrs.class != WindowClass::INPUT_OUTPUT {
-                return Ok(());
-            }
+            // Skip GetWindowAttributes entirely: the `override_redirect` flag is already
+            // present in the CreateNotify event, and INPUT_ONLY windows are rare enough that
+            // tracking them harmlessly is cheaper than a blocking round trip per creation.
+            // (wlroots also takes this approach — see xwayland/xwm.c:xwm_handle_create_notify.)
 
+            // OR windows bypass WM management, so they do not need PROPERTY_CHANGE events.
+            // Subscribing them would flood the event loop with PropertyNotify (Zoom's Chromium
+            // compositor surfaces update hundreds of properties/sec), each triggering a
+            // blocking GetProperty round trip in the PropertyNotify handler.
+            let event_mask = if n.override_redirect {
+                EventMask::FOCUS_CHANGE
+            } else {
+                EventMask::PROPERTY_CHANGE | EventMask::FOCUS_CHANGE
+            };
             xwm.conn.change_window_attributes(
                 n.window,
-                &ChangeWindowAttributesAux::new()
-                    .event_mask(EventMask::PROPERTY_CHANGE | EventMask::FOCUS_CHANGE),
+                &ChangeWindowAttributesAux::new().event_mask(event_mask),
             )?;
             xwm.conn.flush()?;
 
@@ -1572,10 +1624,12 @@ where
                 return Ok(());
             }
 
-            let geo = conn.get_geometry(n.window)?.reply()?;
+            // CreateNotify already carries the initial geometry — no need for a
+            // blocking GetGeometry round trip (which is a hot path when apps like
+            // Zoom create windows rapidly and causes main-loop stalls).
             let geometry = Rectangle::<i32, Client>::new(
-                (geo.x as i32, geo.y as i32).into(),
-                (geo.width as i32, geo.height as i32).into(),
+                (n.x as i32, n.y as i32).into(),
+                (n.width as i32, n.height as i32).into(),
             )
             .to_f64()
             .to_logical(xwm.client_scale.load(Ordering::Acquire))
@@ -1591,7 +1645,7 @@ where
                 geometry,
                 xwm.dnd.xdnd_active.clone(),
             );
-            surface.update_properties()?;
+
             xwm.windows.push(surface.clone());
 
             drop(_guard);
@@ -1607,8 +1661,18 @@ where
                     // we reparent windows, because a lot of stuff expects, that we do
                     let geo_cookie = conn.get_geometry(r.window)?;
                     let attrs_cookie = conn.get_window_attributes(r.window)?;
-                    let geo = geo_cookie.reply()?;
-                    let attrs = attrs_cookie.reply()?;
+                    let geo = match geo_cookie.reply() {
+                        Ok(g) => g,
+                        Err(_) => {
+                            return Ok(());
+                        } // window destroyed before we processed MapRequest
+                    };
+                    let attrs = match attrs_cookie.reply() {
+                        Ok(a) => a,
+                        Err(_) => {
+                            return Ok(());
+                        } // window destroyed before we processed MapRequest
+                    };
                     let colormap = xwm.colormap_for_visual(attrs.visual)?;
 
                     let win = r.window;
@@ -1679,6 +1743,13 @@ where
                         }
                     }
 
+                    // Fetch all WM properties before handing the window to the compositor.
+                    // We deferred this from CreateNotify to here because update_properties()
+                    // makes ~15 sequential blocking GetProperty round-trips, which can take
+                    // 100+ ms while XWayland is at peak load during window creation.  At
+                    // MapRequest time the storm is over and responses are typically <5 ms.
+                    surface.update_properties()?;
+
                     drop(_guard);
                     state.map_window_request(xwm_id, surface);
                 }
@@ -1699,6 +1770,34 @@ where
                 surface.state.lock().unwrap().override_redirect = n.override_redirect;
 
                 if n.override_redirect {
+                    // Get the X11 window attributes to log class and check for INPUT_ONLY.
+                    let attrs = conn
+                        .get_window_attributes(n.window)
+                        .ok()
+                        .and_then(|c| c.reply().ok());
+                    let window_class = attrs.as_ref().map(|a| a.class);
+
+                    // Subscribe to XShape input-region changes.
+                    let _ = conn.shape_select_input(n.window, true);
+
+                    // Query the current input shape.
+                    let shape_rects = conn
+                        .shape_get_rectangles(n.window, ShapeKind::INPUT)
+                        .ok()
+                        .and_then(|cookie| cookie.reply().ok())
+                        .map(|reply| reply.rectangles.len())
+                        .unwrap_or(usize::MAX);
+
+                    // KWin filters InputOnly OR windows before compositing (track()).
+                    // These are transparent input-sink overlays with no visual content.
+                    if window_class == Some(WindowClass::INPUT_ONLY) {
+                        return Ok(());
+                    }
+
+                    // Skip OR windows with an empty input shape (click-through overlays).
+                    let input_passthrough = shape_rects == 0;
+                    surface.set_input_passthrough(input_passthrough);
+
                     drop(_guard);
                     state.mapped_override_redirect_window(xwm_id, surface);
                 } else {
@@ -1830,6 +1929,22 @@ where
         }
         Event::UnmapNotify(n) => {
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
+                // For managed windows, check if this is a duplicate unmap: the frame was
+                // already destroyed and the window is no longer in the client list.
+                // Chromium-based apps (e.g. Zoom) can send hundreds of XUnmapWindow calls
+                // (or ICCCM synthetic UnmapNotify events) per second during startup; without
+                // this guard each one triggers grab_server + reparent_window + schedule_render.
+                if !surface.is_override_redirect() {
+                    let mapped_onto = surface.state.lock().unwrap().mapped_onto;
+                    let in_client_list = xwm.client_list.contains(&surface.window_id());
+                    if mapped_onto.is_none() && !in_client_list {
+                        // Already unmapped — nothing to tear down, no need to notify compositor again.
+                        // Drop the tracing span guard before taking &mut state (NLL: last use of xwm).
+                        drop(_guard);
+                        surface.set_wl_surface(state, None);
+                        return Ok(());
+                    }
+                }
                 xwm.client_list.retain(|w| *w != surface.window_id());
                 xwm.client_list_stacking.retain(|w| *w != surface.window_id());
                 {
@@ -2363,9 +2478,14 @@ where
             }
 
             if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
-                if let Some(property) = surface.update_property(n.atom)? {
-                    drop(_guard);
-                    state.property_notify(xwm_id, surface, property);
+                // Off-load the blocking GetProperty round trip to the property worker thread.
+                // The result arrives back on the main loop via a calloop channel (see start_wm).
+                if xwm.prop_work_tx.try_send((surface, n.atom)).is_err() {
+                    warn!(
+                        window = n.window,
+                        atom = n.atom,
+                        "[XWM] property fetch queue full, dropping PropertyNotify"
+                    );
                 }
             }
         }
@@ -2392,13 +2512,7 @@ where
             }
         }
         Event::ClientMessage(msg) => {
-            if let Some(reply) = conn.get_atom_name(msg.type_)?.reply_unchecked()? {
-                trace!(
-                    event = std::str::from_utf8(&reply.name).unwrap(),
-                    message = ?msg,
-                    "got X11 client event message",
-                );
-            }
+            trace!(atom = msg.type_, message = ?msg, "got X11 client event message");
             match msg.type_ {
                 x if x == xwm.atoms.WL_SURFACE_ID => {
                     let wid = msg.data.as_data32()[0];
@@ -2446,17 +2560,30 @@ where
                                 .surface_for_serial(serial)
                                 .clone()
                         {
-                            debug!(
-                                window = ?xsurface.window_id(),
-                                wl_surface = ?wl_surface.id().protocol_id(),
-                                "associated X11 window to wl_surface",
-                            );
-
+                            // Guard must be dropped before calling into the compositor so it
+                            // can re-enter xwm_state without deadlocking.
                             std::mem::drop(guard);
-                            xsurface.set_wl_surface(state, Some(wl_surface.clone()));
-                            XWaylandShellHandler::surface_associated(state, xwm_id, wl_surface, xsurface);
+
+                            // Let the compositor veto this association (e.g. unmapped OR windows
+                            // should not be associated until they are mapped).  If rejected, keep
+                            // the entry in by_serial so try_associate_or_surface() can retry.
+                            if XWaylandShellHandler::filter_surface_association(
+                                state,
+                                xwm_id,
+                                &wl_surface,
+                                &xsurface,
+                            ) {
+                                trace!(
+                                    window = ?xsurface.window_id(),
+                                    wl_surface = ?wl_surface.id().protocol_id(),
+                                    "associated X11 window to wl_surface",
+                                );
+
+                                xsurface.set_wl_surface(state, Some(wl_surface.clone()));
+                                XWaylandShellHandler::surface_associated(state, xwm_id, wl_surface, xsurface);
+                            }
                         } else {
-                            debug!(
+                            trace!(
                                 window = ?msg.window,
                                 serial = serial,
                                 "no matching wl_surface for X11 window",
@@ -2464,7 +2591,6 @@ where
                             let xwm = state.xwm_state(xwm_id);
                             xwm.unpaired_surfaces.insert(serial, xsurface.window_id());
                             std::mem::drop(guard);
-                            xsurface.set_wl_surface(state, None);
                         }
                     }
                 }
@@ -2683,13 +2809,7 @@ where
                         }
 
                         _ => {
-                            debug!(
-                                "Unhandled WM_PROTOCOLS client msg of type {:?}",
-                                String::from_utf8(
-                                    conn.get_atom_name(data[0])?.reply_unchecked()?.unwrap().name
-                                )
-                                .ok()
-                            )
+                            debug!("Unhandled WM_PROTOCOLS client msg of type atom={}", data[0])
                         }
                     }
                 }
@@ -2729,10 +2849,7 @@ where
                     xwm.dnd.handle_drop(msg.data)?;
                 }
                 x => {
-                    debug!(
-                        "Unhandled client msg of type {:?}",
-                        String::from_utf8(conn.get_atom_name(x)?.reply_unchecked()?.unwrap().name).ok()
-                    )
+                    debug!("Unhandled client msg of type atom={}", x)
                 }
             }
         }
@@ -2781,6 +2898,30 @@ where
                     surface.handle_sync_timeout();
                     drop(_guard);
                     state.sync_request_timeout(xwm_id, surface);
+                }
+            }
+        }
+        Event::ShapeNotify(n) if n.shape_kind == ShapeKind::INPUT => {
+            // An OR window's input shape changed — update its passthrough flag.
+            // When shaped=true and the input region is empty, the window is click-through.
+            if let Some(surface) = xwm
+                .windows
+                .iter()
+                .find(|s| s.window_id() == n.affected_window)
+                .cloned()
+            {
+                if surface.is_override_redirect() {
+                    let input_passthrough = if n.shaped {
+                        // Shape is set; query actual rectangles to see if it's empty.
+                        conn.shape_get_rectangles(n.affected_window, ShapeKind::INPUT)
+                            .ok()
+                            .and_then(|cookie| cookie.reply().ok())
+                            .map(|reply| reply.rectangles.is_empty())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    };
+                    surface.set_input_passthrough(input_passthrough);
                 }
             }
         }

@@ -131,6 +131,11 @@ pub(crate) struct SharedSurfaceState {
     pub(super) mapped_onto: Option<X11Window>,
     pub(super) last_configure: Rectangle<i32, Logical>,
     pub(super) override_redirect: bool,
+    /// True for X11 windows with class `InputOnly` — these have no visual content
+    /// and must not intercept Wayland pointer events.
+    pub(super) input_only: bool,
+    /// True when the X11 window has an empty ShapeInput region (click-through).
+    pub(super) input_passthrough: bool,
 
     // The associated wl_surface.
     wl_surface: Option<WlSurface>,
@@ -367,6 +372,8 @@ impl X11Surface {
                 mapped_onto: None,
                 last_configure: geometry,
                 override_redirect,
+                input_only: false,
+                input_passthrough: false,
                 title: String::from(""),
                 class: String::from(""),
                 instance: String::from(""),
@@ -451,6 +458,16 @@ impl X11Surface {
     /// Returns if this window has the override redirect flag set or not
     pub fn is_override_redirect(&self) -> bool {
         self.state.lock().unwrap().override_redirect
+    }
+
+    /// Returns true if this X11 window has class `InputOnly` (no visual content).
+    pub fn is_input_only(&self) -> bool {
+        self.state.lock().unwrap().input_only
+    }
+
+    /// Sets whether this surface has an empty X11 ShapeInput region (click-through).
+    pub(super) fn set_input_passthrough(&self, passthrough: bool) {
+        self.state.lock().unwrap().input_passthrough = passthrough;
     }
 
     /// Returns if the window is currently mapped or not
@@ -613,6 +630,60 @@ impl X11Surface {
                         Err(err.into())
                     }
                 }
+            }
+        }
+    }
+
+    /// Like [`configure_with_sync`](Self::configure_with_sync) but always sends a sync request
+    /// even when the geometry size hasn't changed.
+    ///
+    /// Use this for the initial map of a window to gate first-frame rendering: the client will
+    /// signal via `_NET_WM_SYNC_REQUEST` when it has finished painting its first frame, and
+    /// [`XwmHandler::sync_request_acked`](super::XwmHandler::sync_request_acked) will fire.
+    /// Falls back to a plain configure if the client doesn't support the sync protocol.
+    pub fn configure_with_forced_sync(
+        &self,
+        rect: impl Into<Rectangle<i32, Logical>>,
+        timeout: Option<Duration>,
+    ) -> Result<(), X11SurfaceError> {
+        if self.is_override_redirect() {
+            return Err(X11SurfaceError::UnsupportedForOverrideRedirect);
+        }
+        let rect = rect.into();
+        let mut state = self.state.lock().unwrap();
+        // Unlike configure_with_sync, we skip the "same size → no sync" optimization.
+        // At initial map the client hasn't rendered yet so it will always respond.
+        match self.send_sync_request(&mut state, timeout.unwrap_or(DEFAULT_SYNC_REQUEST_TIMEOUT)) {
+            Err(SyncRequestError::NotSupported) => {
+                drop(state);
+                self.configure(rect)
+            }
+            Err(SyncRequestError::RequestPending) => {
+                state.buffered_configure = Some(rect);
+                Ok(())
+            }
+            Ok(_) => match self.send_configure(&mut state, rect) {
+                Err(err) => {
+                    self.finish_pending_sync(&mut state);
+                    Err(err)
+                }
+                Ok(pending_configure) => {
+                    state.pending_configure = Some(pending_configure);
+                    state.buffered_configure = None;
+                    Ok(())
+                }
+            },
+            Err(SyncRequestError::IdsExhausted) => {
+                self.set_allow_commits(&state, true);
+                Err(ConnectionError::UnknownError.into())
+            }
+            Err(SyncRequestError::Connection(err)) => {
+                self.set_allow_commits(&state, true);
+                Err(err.into())
+            }
+            Err(SyncRequestError::X11(err)) => {
+                self.set_allow_commits(&state, true);
+                Err(err.into())
             }
         }
     }
@@ -1564,34 +1635,239 @@ impl X11Surface {
     }
 
     pub(super) fn update_properties(&self) -> Result<(), ConnectionError> {
-        self.update_title()?;
-        self.update_class()?;
-        self.update_protocols()?;
-        self.update_hints()?;
-        self.update_normal_hints()?;
-        self.update_transient_for()?;
-        // NET_WM_STATE is managed by the WM, we don't need to update it unless explicitly asked to
-        self.update_net_window_type()?;
-        self.update_motif_hints()?;
-        self.update_startup_id()?;
-        self.update_pid()?;
-        self.update_opacity()?;
-        self.update_steam_game()?;
-        self.update_steam_overlay()?;
-        self.update_steam_bigpicture()?;
-        self.update_steam_input_focus()?;
-        self.update_external_overlay()?;
-        if let Some(conn) = self.conn.upgrade() {
+        let conn = self.conn.upgrade().ok_or(ConnectionError::UnknownError)?;
+        let win = self.window;
+        let atoms = self.atoms;
+
+        // ── Phase 1: fire all GetProperty requests without waiting for any reply ──
+        //
+        // x11rb buffers writes; no network round-trip occurs until the first
+        // .reply_unchecked() call (which also flushes).  Sending all 19 requests
+        // upfront means the X11 server receives them in one batch and we wait for
+        // exactly ONE RTT instead of 19 sequential ones (~8 ms vs ~120 ms when
+        // XWayland is under load from Zoom's Chromium compositor).
+        let ck_net_name = conn.get_property(false, win, atoms._NET_WM_NAME, AtomEnum::ANY, 0, 2048)?;
+        let ck_wm_name = conn.get_property(false, win, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 2048)?;
+        let ck_class = WmClass::get(&*conn, win)?;
+        let ck_protocols = conn.get_property(false, win, atoms.WM_PROTOCOLS, AtomEnum::ATOM, 0, 2048)?;
+        let ck_hints = WmHints::get(&*conn, win)?;
+        let ck_nhints = WmSizeHints::get_normal_hints(&*conn, win)?;
+        let ck_transient =
+            conn.get_property(false, win, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 2048)?;
+        let ck_win_type =
+            conn.get_property(false, win, atoms._NET_WM_WINDOW_TYPE, AtomEnum::ATOM, 0, 1024)?;
+        let ck_motif = conn.get_property(false, win, atoms._MOTIF_WM_HINTS, AtomEnum::ANY, 0, 2048)?;
+        let ck_startup_id = conn.get_property(false, win, atoms._NET_STARTUP_ID, AtomEnum::ANY, 0, 2048)?;
+        let ck_pid = conn.get_property(false, win, atoms._NET_WM_PID, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_opacity =
+            conn.get_property(false, win, atoms._NET_WM_WINDOW_OPACITY, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_steam_game = conn.get_property(false, win, atoms.STEAM_GAME, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_steam_ovly = conn.get_property(false, win, atoms.STEAM_OVERLAY, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_steam_bigp =
+            conn.get_property(false, win, atoms.STEAM_BIGPICTURE, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_steam_inpt =
+            conn.get_property(false, win, atoms.STEAM_INPUT_FOCUS, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_ext_ovly = conn.get_property(
+            false,
+            win,
+            atoms.GAMESCOPE_EXTERNAL_OVERLAY,
+            AtomEnum::CARDINAL,
+            0,
+            1,
+        )?;
+        let ck_opaque = conn.get_property(
+            false,
+            win,
+            atoms._NET_WM_OPAQUE_REGION,
+            AtomEnum::CARDINAL,
+            0,
+            u32::MAX,
+        )?;
+        let ck_gtk_ext = conn.get_property(false, win, atoms._GTK_FRAME_EXTENTS, AtomEnum::CARDINAL, 0, 4)?;
+        // NOTE: do NOT call .reply() on any cookie above until ALL are sent.
+        // The first .reply_unchecked() below flushes the write buffer.
+
+        // ── Phase 2: collect all replies ──────────────────────────────────────────
+
+        // Helper to decode a string property reply (UTF-8 or latin-1).
+        let decode_string = |r: &x11rb::protocol::xproto::GetPropertyReply| -> Option<String> {
+            let bytes = r.value8()?.collect::<Vec<u8>>();
+            if r.type_ == atoms.UTF8_STRING {
+                String::from_utf8(bytes).ok()
+            } else if r.type_ == AtomEnum::STRING.into() {
+                Some(WINDOWS_1252.decode(&bytes).0.to_string())
+            } else {
+                None
+            }
+        };
+
+        // title: prefer _NET_WM_NAME (UTF-8), fall back to WM_NAME
+        let title = {
+            let net = ck_net_name.reply_unchecked()?.and_then(|r| decode_string(&r));
+            let wm = ck_wm_name.reply_unchecked()?.and_then(|r| decode_string(&r));
+            net.or(wm).unwrap_or_default()
+        };
+
+        // WM_CLASS → class + instance
+        let (class, instance) = match ck_class.reply_unchecked() {
+            Ok(Some(wm_class)) => (
+                WINDOWS_1252.decode(wm_class.class()).0.to_string(),
+                WINDOWS_1252.decode(wm_class.instance()).0.to_string(),
+            ),
+            Ok(None) | Err(ConnectionError::ParseError(_)) => (String::new(), String::new()),
+            Err(err) => return Err(err),
+        };
+
+        // WM_PROTOCOLS
+        let raw_protocols: Vec<Atom> = match ck_protocols.reply_unchecked() {
+            Ok(Some(r)) => r.value32().map(|v| v.collect()).unwrap_or_default(),
+            Ok(None) | Err(ConnectionError::ParseError(_)) => vec![],
+            Err(err) => return Err(err),
+        };
+
+        // WM_HINTS / WM_NORMAL_HINTS
+        let hints = match ck_hints.reply_unchecked() {
+            Ok(h) => h,
+            Err(ConnectionError::ParseError(_)) => None,
+            Err(err) => return Err(err),
+        };
+        let normal_hints = match ck_nhints.reply_unchecked() {
+            Ok(h) => h,
+            Err(ConnectionError::ParseError(_)) => None,
+            Err(err) => return Err(err),
+        };
+
+        // WM_TRANSIENT_FOR
+        let transient_for = match ck_transient.reply_unchecked() {
+            Ok(Some(r)) => r.value32().and_then(|mut it| it.next()).filter(|w| *w != 0),
+            Ok(None) | Err(ConnectionError::ParseError(_)) => None,
+            Err(err) => return Err(err),
+        };
+
+        // _NET_WM_WINDOW_TYPE
+        let window_type: Vec<Atom> = match ck_win_type.reply_unchecked() {
+            Ok(Some(r)) => r.value32().map(|v| v.collect()).unwrap_or_default(),
+            Ok(None) | Err(ConnectionError::ParseError(_)) => vec![],
+            Err(err) => return Err(err),
+        };
+
+        // _MOTIF_WM_HINTS
+        let motif_hints: Vec<u32> = match ck_motif.reply_unchecked() {
+            Ok(Some(r)) => {
+                let v: Vec<u32> = r.value32().map(|it| it.collect()).unwrap_or_default();
+                if v.len() >= 5 { v } else { vec![] }
+            }
+            Ok(None) | Err(ConnectionError::ParseError(_)) => vec![],
+            Err(err) => return Err(err),
+        };
+
+        // _NET_STARTUP_ID
+        let startup_id = ck_startup_id.reply_unchecked()?.and_then(|r| decode_string(&r));
+
+        // Single-u32 properties (use .and_then chain for concise null-handling)
+        let read_u32 = |reply: Result<Option<x11rb::protocol::xproto::GetPropertyReply>, ConnectionError>| -> Result<Option<u32>, ConnectionError> {
+            Ok(reply?.and_then(|r| r.value32()?.next()))
+        };
+        let pid = read_u32(ck_pid.reply_unchecked())?;
+        let opacity = read_u32(ck_opacity.reply_unchecked())?;
+        let steam_game = read_u32(ck_steam_game.reply_unchecked())?;
+        let steam_ovly = read_u32(ck_steam_ovly.reply_unchecked())?;
+        let steam_bigp = read_u32(ck_steam_bigp.reply_unchecked())?;
+        let steam_inpt = read_u32(ck_steam_inpt.reply_unchecked())?;
+        let ext_ovly = read_u32(ck_ext_ovly.reply_unchecked())?;
+
+        // _NET_WM_OPAQUE_REGION
+        let client_scale = self
+            .client_scale
+            .as_ref()
+            .map(|s| s.load(Ordering::Acquire))
+            .unwrap_or(1.0);
+        let opaque_region = ck_opaque
+            .reply_unchecked()?
+            .and_then(|r| {
+                r.value32().map(|values| {
+                    values
+                        .collect::<Vec<_>>()
+                        .chunks_exact(4)
+                        .flat_map(|rv| {
+                            let phys = Rectangle::<i32, Physical>::new(
+                                (rv[0] as i32, rv[1] as i32).into(),
+                                ((rv[2] as i32).max(0), (rv[3] as i32).max(0)).into(),
+                            );
+                            if phys.is_empty() {
+                                None
+                            } else {
+                                Some((
+                                    RectangleKind::Add,
+                                    phys.to_f64().to_logical(client_scale).to_i32_round::<i32>(),
+                                ))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .map(|rects| RegionAttributes { rects });
+
+        // _GTK_FRAME_EXTENTS
+        let frame_extents = ck_gtk_ext
+            .reply_unchecked()?
+            .and_then(|r| {
+                r.value32().and_then(|mut v| {
+                    Some(FrameExtents::new(
+                        (v.next()? as i32).max(0),
+                        (v.next()? as i32).max(0),
+                        (v.next()? as i32).max(0),
+                        (v.next()? as i32).max(0),
+                    ))
+                })
+            })
+            .unwrap_or_default();
+
+        // ── Phase 3: write all parsed values to state in one lock acquisition ─
+        {
             let mut state = self.state.lock().unwrap();
-            state.opaque_region = fetch_opaque_regions(
-                &conn,
-                self.window,
-                self.atoms._NET_WM_OPAQUE_REGION,
-                self.client_scale.as_ref(),
-            )?;
+            state.title = title;
+            state.class = class;
+            state.instance = instance;
+            state.hints = hints;
+            state.normal_hints = normal_hints;
+            state.transient_for = transient_for;
+            state.window_type = window_type;
+            state.motif_hints = motif_hints;
+            if let Some(id) = startup_id {
+                state.startup_id = Some(id);
+            }
+            if let Some(p) = pid {
+                state.pid = Some(p);
+            }
+            if let Some(o) = opacity {
+                state.opacity = Some(o);
+            }
+            state.steam_game = steam_game;
+            state.steam_overlay = steam_ovly;
+            state.steam_bigpicture = steam_bigp;
+            state.steam_input_focus = steam_inpt;
+            state.external_overlay = ext_ovly;
+            state.opaque_region = opaque_region;
             state.opaque_region_dirty = false;
+            state.frame_extents = frame_extents;
+            // NET_WM_STATE is managed by the WM and not fetched here.
+            state.protocols = raw_protocols
+                .into_iter()
+                .filter_map(|a| match a {
+                    a if a == atoms.WM_TAKE_FOCUS => Some(WMProtocol::TakeFocus),
+                    a if a == atoms.WM_DELETE_WINDOW => Some(WMProtocol::DeleteWindow),
+                    a if a == atoms._NET_WM_PING => Some(WMProtocol::NetWmPing),
+                    a if a == atoms._NET_WM_SYNC_REQUEST => Some(WMProtocol::NetWmSyncRequest),
+                    _ => None,
+                })
+                .collect();
         }
-        self.update_toolkit_frame_extents()?;
+
+        // _NET_WM_SYNC_REQUEST counter setup (at most one extra round-trip,
+        // only if the window supports the protocol).
+        self.init_net_wm_sync_request()?;
+
         Ok(())
     }
 
@@ -2157,6 +2433,12 @@ impl X11Surface {
         }
         if self.xdnd_active.load(Ordering::Acquire) && self.is_override_redirect() {
             return None;
+        }
+        {
+            let state = self.state.lock().unwrap();
+            if state.input_only || state.input_passthrough {
+                return None;
+            }
         }
         if let Some(surface) = X11Surface::wl_surface(self).as_ref() {
             return under_from_surface_tree(surface, point, location, surface_type);
