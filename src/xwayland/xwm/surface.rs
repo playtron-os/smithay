@@ -1473,6 +1473,32 @@ impl X11Surface {
         Ok(())
     }
 
+    /// Send `XMapWindow` on the raw client window to request a re-map.
+    ///
+    /// After UnmapNotify, smithay re-parents the client back to the root and
+    /// destroys the WM frame. Calling this sends MapWindow on the client
+    /// window (now a direct child of root), which triggers SubstructureRedirect
+    /// → MapRequest → smithay recreates the frame and fires `map_window_request`.
+    pub fn request_map(&self) -> Result<(), ConnectionError> {
+        if let Some(conn) = self.conn.upgrade() {
+            use x11rb::protocol::xproto::{MAP_REQUEST_EVENT, MapRequestEvent};
+            let root = conn.setup().roots[0].root;
+            conn.send_event(
+                false,
+                root,
+                EventMask::SUBSTRUCTURE_REDIRECT,
+                MapRequestEvent {
+                    response_type: MAP_REQUEST_EVENT,
+                    sequence: 0,
+                    parent: root,
+                    window: self.window,
+                },
+            )?;
+            conn.flush()?;
+        }
+        Ok(())
+    }
+
     /// Sets the window as activated or not.
     ///
     /// Allows the client to reflect this state in their UI.
@@ -1646,25 +1672,44 @@ impl X11Surface {
         // upfront means the X11 server receives them in one batch and we wait for
         // exactly ONE RTT instead of 19 sequential ones (~8 ms vs ~120 ms when
         // XWayland is under load from Zoom's Chromium compositor).
-        let ck_net_name   = conn.get_property(false, win, atoms._NET_WM_NAME,               AtomEnum::ANY,      0, 2048)?;
-        let ck_wm_name    = conn.get_property(false, win, AtomEnum::WM_NAME,                AtomEnum::ANY,      0, 2048)?;
-        let ck_class      = WmClass::get(&*conn, win)?;
-        let ck_protocols  = conn.get_property(false, win, atoms.WM_PROTOCOLS,               AtomEnum::ATOM,     0, 2048)?;
-        let ck_hints      = WmHints::get(&*conn, win)?;
-        let ck_nhints     = WmSizeHints::get_normal_hints(&*conn, win)?;
-        let ck_transient  = conn.get_property(false, win, AtomEnum::WM_TRANSIENT_FOR,       AtomEnum::WINDOW,   0, 2048)?;
-        let ck_win_type   = conn.get_property(false, win, atoms._NET_WM_WINDOW_TYPE,        AtomEnum::ATOM,     0, 1024)?;
-        let ck_motif      = conn.get_property(false, win, atoms._MOTIF_WM_HINTS,            AtomEnum::ANY,      0, 2048)?;
-        let ck_startup_id = conn.get_property(false, win, atoms._NET_STARTUP_ID,            AtomEnum::ANY,      0, 2048)?;
-        let ck_pid        = conn.get_property(false, win, atoms._NET_WM_PID,                AtomEnum::CARDINAL, 0, 1)?;
-        let ck_opacity    = conn.get_property(false, win, atoms._NET_WM_WINDOW_OPACITY,     AtomEnum::CARDINAL, 0, 1)?;
-        let ck_steam_game = conn.get_property(false, win, atoms.STEAM_GAME,                 AtomEnum::CARDINAL, 0, 1)?;
-        let ck_steam_ovly = conn.get_property(false, win, atoms.STEAM_OVERLAY,              AtomEnum::CARDINAL, 0, 1)?;
-        let ck_steam_bigp = conn.get_property(false, win, atoms.STEAM_BIGPICTURE,           AtomEnum::CARDINAL, 0, 1)?;
-        let ck_steam_inpt = conn.get_property(false, win, atoms.STEAM_INPUT_FOCUS,          AtomEnum::CARDINAL, 0, 1)?;
-        let ck_ext_ovly   = conn.get_property(false, win, atoms.GAMESCOPE_EXTERNAL_OVERLAY, AtomEnum::CARDINAL, 0, 1)?;
-        let ck_opaque     = conn.get_property(false, win, atoms._NET_WM_OPAQUE_REGION,      AtomEnum::CARDINAL, 0, u32::MAX)?;
-        let ck_gtk_ext    = conn.get_property(false, win, atoms._GTK_FRAME_EXTENTS,         AtomEnum::CARDINAL, 0, 4)?;
+        let ck_net_name = conn.get_property(false, win, atoms._NET_WM_NAME, AtomEnum::ANY, 0, 2048)?;
+        let ck_wm_name = conn.get_property(false, win, AtomEnum::WM_NAME, AtomEnum::ANY, 0, 2048)?;
+        let ck_class = WmClass::get(&*conn, win)?;
+        let ck_protocols = conn.get_property(false, win, atoms.WM_PROTOCOLS, AtomEnum::ATOM, 0, 2048)?;
+        let ck_hints = WmHints::get(&*conn, win)?;
+        let ck_nhints = WmSizeHints::get_normal_hints(&*conn, win)?;
+        let ck_transient =
+            conn.get_property(false, win, AtomEnum::WM_TRANSIENT_FOR, AtomEnum::WINDOW, 0, 2048)?;
+        let ck_win_type =
+            conn.get_property(false, win, atoms._NET_WM_WINDOW_TYPE, AtomEnum::ATOM, 0, 1024)?;
+        let ck_motif = conn.get_property(false, win, atoms._MOTIF_WM_HINTS, AtomEnum::ANY, 0, 2048)?;
+        let ck_startup_id = conn.get_property(false, win, atoms._NET_STARTUP_ID, AtomEnum::ANY, 0, 2048)?;
+        let ck_pid = conn.get_property(false, win, atoms._NET_WM_PID, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_opacity =
+            conn.get_property(false, win, atoms._NET_WM_WINDOW_OPACITY, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_steam_game = conn.get_property(false, win, atoms.STEAM_GAME, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_steam_ovly = conn.get_property(false, win, atoms.STEAM_OVERLAY, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_steam_bigp =
+            conn.get_property(false, win, atoms.STEAM_BIGPICTURE, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_steam_inpt =
+            conn.get_property(false, win, atoms.STEAM_INPUT_FOCUS, AtomEnum::CARDINAL, 0, 1)?;
+        let ck_ext_ovly = conn.get_property(
+            false,
+            win,
+            atoms.GAMESCOPE_EXTERNAL_OVERLAY,
+            AtomEnum::CARDINAL,
+            0,
+            1,
+        )?;
+        let ck_opaque = conn.get_property(
+            false,
+            win,
+            atoms._NET_WM_OPAQUE_REGION,
+            AtomEnum::CARDINAL,
+            0,
+            u32::MAX,
+        )?;
+        let ck_gtk_ext = conn.get_property(false, win, atoms._GTK_FRAME_EXTENTS, AtomEnum::CARDINAL, 0, 4)?;
         // NOTE: do NOT call .reply() on any cookie above until ALL are sent.
         // The first .reply_unchecked() below flushes the write buffer.
 
@@ -1685,7 +1730,7 @@ impl X11Surface {
         // title: prefer _NET_WM_NAME (UTF-8), fall back to WM_NAME
         let title = {
             let net = ck_net_name.reply_unchecked()?.and_then(|r| decode_string(&r));
-            let wm  = ck_wm_name.reply_unchecked()?.and_then(|r| decode_string(&r));
+            let wm = ck_wm_name.reply_unchecked()?.and_then(|r| decode_string(&r));
             net.or(wm).unwrap_or_default()
         };
 
@@ -1749,35 +1794,49 @@ impl X11Surface {
         let read_u32 = |reply: Result<Option<x11rb::protocol::xproto::GetPropertyReply>, ConnectionError>| -> Result<Option<u32>, ConnectionError> {
             Ok(reply?.and_then(|r| r.value32()?.next()))
         };
-        let pid          = read_u32(ck_pid.reply_unchecked())?;
-        let opacity      = read_u32(ck_opacity.reply_unchecked())?;
-        let steam_game   = read_u32(ck_steam_game.reply_unchecked())?;
-        let steam_ovly   = read_u32(ck_steam_ovly.reply_unchecked())?;
-        let steam_bigp   = read_u32(ck_steam_bigp.reply_unchecked())?;
-        let steam_inpt   = read_u32(ck_steam_inpt.reply_unchecked())?;
-        let ext_ovly     = read_u32(ck_ext_ovly.reply_unchecked())?;
+        let pid = read_u32(ck_pid.reply_unchecked())?;
+        let opacity = read_u32(ck_opacity.reply_unchecked())?;
+        let steam_game = read_u32(ck_steam_game.reply_unchecked())?;
+        let steam_ovly = read_u32(ck_steam_ovly.reply_unchecked())?;
+        let steam_bigp = read_u32(ck_steam_bigp.reply_unchecked())?;
+        let steam_inpt = read_u32(ck_steam_inpt.reply_unchecked())?;
+        let ext_ovly = read_u32(ck_ext_ovly.reply_unchecked())?;
 
         // _NET_WM_OPAQUE_REGION
-        let client_scale = self.client_scale.as_ref()
+        let client_scale = self
+            .client_scale
+            .as_ref()
             .map(|s| s.load(Ordering::Acquire))
             .unwrap_or(1.0);
-        let opaque_region = ck_opaque.reply_unchecked()?.and_then(|r| {
-            r.value32().map(|values| {
-                values.collect::<Vec<_>>().chunks_exact(4)
-                    .flat_map(|rv| {
-                        let phys = Rectangle::<i32, Physical>::new(
-                            (rv[0] as i32, rv[1] as i32).into(),
-                            ((rv[2] as i32).max(0), (rv[3] as i32).max(0)).into(),
-                        );
-                        if phys.is_empty() { None }
-                        else { Some((RectangleKind::Add, phys.to_f64().to_logical(client_scale).to_i32_round::<i32>())) }
-                    })
-                    .collect::<Vec<_>>()
+        let opaque_region = ck_opaque
+            .reply_unchecked()?
+            .and_then(|r| {
+                r.value32().map(|values| {
+                    values
+                        .collect::<Vec<_>>()
+                        .chunks_exact(4)
+                        .flat_map(|rv| {
+                            let phys = Rectangle::<i32, Physical>::new(
+                                (rv[0] as i32, rv[1] as i32).into(),
+                                ((rv[2] as i32).max(0), (rv[3] as i32).max(0)).into(),
+                            );
+                            if phys.is_empty() {
+                                None
+                            } else {
+                                Some((
+                                    RectangleKind::Add,
+                                    phys.to_f64().to_logical(client_scale).to_i32_round::<i32>(),
+                                ))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                })
             })
-        }).map(|rects| RegionAttributes { rects });
+            .map(|rects| RegionAttributes { rects });
 
         // _GTK_FRAME_EXTENTS
-        let frame_extents = ck_gtk_ext.reply_unchecked()?
+        let frame_extents = ck_gtk_ext
+            .reply_unchecked()?
             .and_then(|r| {
                 r.value32().and_then(|mut v| {
                     Some(FrameExtents::new(
@@ -1793,31 +1852,38 @@ impl X11Surface {
         // ── Phase 3: write all parsed values to state in one lock acquisition ─
         {
             let mut state = self.state.lock().unwrap();
-            state.title        = title;
-            state.class        = class;
-            state.instance     = instance;
-            state.hints        = hints;
+            state.title = title;
+            state.class = class;
+            state.instance = instance;
+            state.hints = hints;
             state.normal_hints = normal_hints;
             state.transient_for = transient_for;
-            state.window_type  = window_type;
-            state.motif_hints  = motif_hints;
-            if let Some(id) = startup_id { state.startup_id = Some(id); }
-            if let Some(p) = pid         { state.pid        = Some(p); }
-            if let Some(o) = opacity     { state.opacity    = Some(o); }
-            state.steam_game         = steam_game;
-            state.steam_overlay      = steam_ovly;
-            state.steam_bigpicture   = steam_bigp;
-            state.steam_input_focus  = steam_inpt;
-            state.external_overlay   = ext_ovly;
-            state.opaque_region      = opaque_region;
+            state.window_type = window_type;
+            state.motif_hints = motif_hints;
+            if let Some(id) = startup_id {
+                state.startup_id = Some(id);
+            }
+            if let Some(p) = pid {
+                state.pid = Some(p);
+            }
+            if let Some(o) = opacity {
+                state.opacity = Some(o);
+            }
+            state.steam_game = steam_game;
+            state.steam_overlay = steam_ovly;
+            state.steam_bigpicture = steam_bigp;
+            state.steam_input_focus = steam_inpt;
+            state.external_overlay = ext_ovly;
+            state.opaque_region = opaque_region;
             state.opaque_region_dirty = false;
-            state.frame_extents      = frame_extents;
+            state.frame_extents = frame_extents;
             // NET_WM_STATE is managed by the WM and not fetched here.
-            state.protocols = raw_protocols.into_iter()
+            state.protocols = raw_protocols
+                .into_iter()
                 .filter_map(|a| match a {
-                    a if a == atoms.WM_TAKE_FOCUS       => Some(WMProtocol::TakeFocus),
-                    a if a == atoms.WM_DELETE_WINDOW    => Some(WMProtocol::DeleteWindow),
-                    a if a == atoms._NET_WM_PING        => Some(WMProtocol::NetWmPing),
+                    a if a == atoms.WM_TAKE_FOCUS => Some(WMProtocol::TakeFocus),
+                    a if a == atoms.WM_DELETE_WINDOW => Some(WMProtocol::DeleteWindow),
+                    a if a == atoms._NET_WM_PING => Some(WMProtocol::NetWmPing),
                     a if a == atoms._NET_WM_SYNC_REQUEST => Some(WMProtocol::NetWmSyncRequest),
                     _ => None,
                 })
