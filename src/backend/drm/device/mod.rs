@@ -319,10 +319,6 @@ impl DrmDevice {
             return Err(Error::SurfaceWithoutConnectors(crtc));
         }
 
-        if !self.is_active() {
-            return Err(Error::DeviceInactive);
-        }
-
         let planes = self.planes(&crtc)?;
 
         let selected_primary_plane = planes.primary.iter().find_map(|plane| {

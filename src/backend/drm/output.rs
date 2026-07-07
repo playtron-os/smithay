@@ -481,7 +481,9 @@ where
 
         let compositor = self.compositor.get_mut(&crtc).unwrap();
         let compositor = compositor.get_mut().unwrap();
-        if let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer) {
+        if self.device.is_active()
+            && let Err(err) = render_elements.submit_composited_frame(&mut *compositor, renderer)
+        {
             self.compositor.remove(&crtc);
             return Err(err);
         }

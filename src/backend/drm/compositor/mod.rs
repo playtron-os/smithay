@@ -1605,6 +1605,10 @@ where
             }),
         };
 
+        if !drm.is_active() {
+            return Ok((swapchain, use_opaque));
+        }
+
         match current_frame_state.test_state(drm, supports_fencing, drm.plane(), plane_state, true) {
             Ok(_) => Ok((swapchain, use_opaque)),
             Err(err) => {
