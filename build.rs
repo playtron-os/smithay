@@ -67,6 +67,11 @@ fn gl_generate() {
                 "GL_EXT_unpack_subimage",
                 "GL_OES_EGL_sync",
                 "GL_EXT_disjoint_timer_query",
+                // Robustness: pulls in the *KHR/*EXT reset-status entry points so
+                // glGetGraphicsResetStatus is loadable on a robust context even when
+                // the core (un-suffixed) symbol is absent (e.g. a GLES 3.0 context).
+                "GL_KHR_robustness",
+                "GL_EXT_robustness",
             ],
         )
         .write_bindings(gl_generator::StructGenerator, &mut file)

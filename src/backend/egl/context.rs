@@ -237,7 +237,7 @@ impl EGLContext {
             }
         };
 
-        let mut context_attributes = Vec::with_capacity(12);
+        let mut context_attributes = Vec::with_capacity(16);
 
         if let Some((attributes, _)) = config {
             let version = attributes.version;
@@ -287,20 +287,53 @@ impl EGLContext {
             }
         }
 
+        // Request a robust context with reset notification when supported, so a GPU
+        // reset marks the context lost and `glGetGraphicsResetStatus()` reports it —
+        // instead of Mesa (radeonsi) aborting the whole process (SIGABRT) on reset.
+        // This is what enables graceful GPU-reset recovery in the GLES renderer.
+        let robustness_supported = display
+            .extensions()
+            .iter()
+            .any(|x| x == "EGL_EXT_create_context_robustness");
+        // Length of the attribute list *without* robustness, so we can retry if a
+        // driver advertises the extension but rejects the robustness attributes.
+        let attrs_without_robustness_len = context_attributes.len();
+        if robustness_supported {
+            trace!("Requesting robust context (EGL_EXT_create_context_robustness, LOSE_CONTEXT_ON_RESET)");
+            context_attributes.push(ffi::egl::CONTEXT_OPENGL_ROBUST_ACCESS_EXT as i32);
+            context_attributes.push(ffi::egl::TRUE as i32);
+            context_attributes.push(ffi::egl::CONTEXT_OPENGL_RESET_NOTIFICATION_STRATEGY_EXT as i32);
+            context_attributes.push(ffi::egl::LOSE_CONTEXT_ON_RESET_EXT as i32);
+        }
+
         context_attributes.push(ffi::egl::NONE as i32);
 
         trace!("Creating EGL context...");
-        let context = wrap_egl_call_ptr(|| unsafe {
-            ffi::egl::CreateContext(
-                **display.get_display_handle(),
-                config_id,
-                shared
-                    .map(|context| context.context)
-                    .unwrap_or(ffi::egl::NO_CONTEXT),
-                context_attributes.as_ptr(),
-            )
-        })
-        .map_err(Error::CreationFailed)?;
+        let create_context = |attributes: &[i32]| {
+            wrap_egl_call_ptr(|| unsafe {
+                ffi::egl::CreateContext(
+                    **display.get_display_handle(),
+                    config_id,
+                    shared
+                        .map(|context| context.context)
+                        .unwrap_or(ffi::egl::NO_CONTEXT),
+                    attributes.as_ptr(),
+                )
+            })
+        };
+        let context = match create_context(&context_attributes) {
+            Ok(context) => context,
+            Err(err) if robustness_supported => {
+                warn!(
+                    ?err,
+                    "Robust EGL context creation failed; retrying without robustness (GPU-reset recovery unavailable for this context)"
+                );
+                context_attributes.truncate(attrs_without_robustness_len);
+                context_attributes.push(ffi::egl::NONE as i32);
+                create_context(&context_attributes).map_err(Error::CreationFailed)?
+            }
+            Err(err) => return Err(Error::CreationFailed(err)),
+        };
         span.record("ptr", context as usize);
 
         let context_priority = if has_context_priority {

@@ -770,6 +770,35 @@ impl GlesRenderer {
         self.gles_cleanup().cleanup(&self.egl, &self.gl);
     }
 
+    /// Query the GL context reset status via `glGetGraphicsResetStatus`.
+    ///
+    /// Returns `Err(GlesError::ContextReset)` if the GPU/driver reset the context — all
+    /// GL resources are then lost and the renderer must be recreated. Requires a robust
+    /// context (see [`EGLContext`] robustness); on a non-robust context or a driver
+    /// without `GL_{KHR,EXT}_robustness` the query is unavailable and this reports no
+    /// reset (the previous crash-on-reset behaviour).
+    fn check_reset(&self) -> Result<(), GlesError> {
+        // Try the core entry point first, then the KHR/EXT aliases (a GLES 3.0 context
+        // may only expose the extension-suffixed symbols). All are null (`!is_loaded`)
+        // on a non-robust context, in which case there is nothing to detect.
+        let status = if self.gl.GetGraphicsResetStatus.is_loaded() {
+            unsafe { self.gl.GetGraphicsResetStatus() }
+        } else if self.gl.GetGraphicsResetStatusKHR.is_loaded() {
+            unsafe { self.gl.GetGraphicsResetStatusKHR() }
+        } else if self.gl.GetGraphicsResetStatusEXT.is_loaded() {
+            unsafe { self.gl.GetGraphicsResetStatusEXT() }
+        } else {
+            return Ok(());
+        };
+        match status {
+            ffi::NO_ERROR => Ok(()),
+            status => {
+                warn!("GL context reset detected (status {status:#x}); renderer must be recreated");
+                Err(GlesError::ContextReset)
+            }
+        }
+    }
+
     /// Returns the supported [`Capabilities`](Capability) of this renderer.
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
@@ -2091,6 +2120,11 @@ impl Renderer for GlesRenderer {
         'buffer: 'frame,
     {
         target.0.make_current(&self.gl, &self.egl)?;
+
+        // Detect a GPU reset from a previous frame before issuing new commands, so it
+        // surfaces as a recoverable `ContextReset` error instead of Mesa aborting the
+        // whole process on the next submit.
+        self.check_reset()?;
 
         // Collect last frame's timestamps.
         self.profiler.collect(&self.gl);

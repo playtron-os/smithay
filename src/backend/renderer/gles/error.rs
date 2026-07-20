@@ -88,6 +88,10 @@ pub enum GlesError {
     /// Blocking for a synchronization primitive failed
     #[error("Blocking for a synchronization primitive got interrupted")]
     SyncInterrupted,
+    /// The GL context was reset (GPU reset / TDR). All GL resources are lost;
+    /// the renderer and its `EGLContext` must be recreated to recover.
+    #[error("The GL context was reset (GPU reset); the renderer must be recreated")]
+    ContextReset,
 }
 
 impl From<GlesError> for SwapBuffersError {
@@ -100,7 +104,8 @@ impl From<GlesError> for SwapBuffersError {
             | x @ GlesError::GLFunctionLoaderError
             | x @ GlesError::GLExtensionNotSupported(_)
             | x @ GlesError::EGLExtensionNotSupported(_)
-            | x @ GlesError::GLVersionNotSupported(_) => SwapBuffersError::ContextLost(Box::new(x)),
+            | x @ GlesError::GLVersionNotSupported(_)
+            | x @ GlesError::ContextReset => SwapBuffersError::ContextLost(Box::new(x)),
             GlesError::ContextActivationError(err) => err.into(),
             x @ GlesError::FramebufferBindingError
             | x @ GlesError::BindBufferEGLError(_)
@@ -129,7 +134,8 @@ impl From<GlesError> for SwapBuffersError {
             | x @ GlesError::GLFunctionLoaderError
             | x @ GlesError::GLExtensionNotSupported(_)
             | x @ GlesError::EGLExtensionNotSupported(_)
-            | x @ GlesError::GLVersionNotSupported(_) => SwapBuffersError::ContextLost(Box::new(x)),
+            | x @ GlesError::GLVersionNotSupported(_)
+            | x @ GlesError::ContextReset => SwapBuffersError::ContextLost(Box::new(x)),
             GlesError::ContextActivationError(err) => err.into(),
             x @ GlesError::FramebufferBindingError
             | x @ GlesError::MappingError
