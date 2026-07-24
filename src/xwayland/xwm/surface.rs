@@ -1402,8 +1402,17 @@ impl X11Surface {
     /// Returns true if the window is client-side decorated
     pub fn is_decorated(&self) -> bool {
         let state = self.state.lock().unwrap();
-        if (state.motif_hints[MWM_HINTS_FLAGS_FIELD] & MWM_HINTS_DECORATIONS) != 0 {
-            return state.motif_hints[MWM_HINTS_DECORATIONS_FIELD] == 0;
+        // Clients control the length of the _MOTIF_WM_HINTS array, so index
+        // defensively — a short/empty array (e.g. from some Xlib/XCB toolkits)
+        // must not panic and poison the surface state lock.
+        let flags = state.motif_hints.get(MWM_HINTS_FLAGS_FIELD).copied().unwrap_or(0);
+        if (flags & MWM_HINTS_DECORATIONS) != 0 {
+            return state
+                .motif_hints
+                .get(MWM_HINTS_DECORATIONS_FIELD)
+                .copied()
+                .unwrap_or(0)
+                == 0;
         }
         false
     }
