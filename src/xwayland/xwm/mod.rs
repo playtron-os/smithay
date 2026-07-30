@@ -253,6 +253,12 @@ mod atoms {
             STEAM_INPUT_FOCUS,
             GAMESCOPE_EXTERNAL_OVERLAY,
 
+            // base-layer control, set by the session manager on the ROOT window:
+            // an ordered list of app ids describing which app should be the base
+            // layer (and in what priority), plus an explicit window override.
+            GAMESCOPECTRL_BASELAYER_APPID,
+            GAMESCOPECTRL_BASELAYER_WINDOW,
+
             // server -> client
             WM_S0,
             WM_STATE,
@@ -424,6 +430,16 @@ pub trait XwmHandler {
     /// A window property has changed.
     fn property_notify(&mut self, xwm: XwmId, window: X11Surface, property: WmWindowProperty) {
         let _ = (xwm, window, property);
+    }
+    /// The base-layer control properties on the root window changed.
+    ///
+    /// `appids` is the ordered app-id list from `GAMESCOPECTRL_BASELAYER_APPID`
+    /// (highest priority first) and `window` the explicit override from
+    /// `GAMESCOPECTRL_BASELAYER_WINDOW`, if either is set. A session manager uses
+    /// these to tell the compositor which app owns the base layer without having
+    /// to focus it, so the compositor can decide stacking itself.
+    fn baselayer_changed(&mut self, xwm: XwmId, appids: Vec<u32>, window: Option<X11Window>) {
+        let _ = (xwm, appids, window);
     }
     /// Window requests to be maximized.
     fn maximize_request(&mut self, xwm: XwmId, window: X11Surface) {
@@ -2380,6 +2396,29 @@ where
             }
         }
         Event::PropertyNotify(n) => {
+            // Base-layer control lives on the ROOT window, not on a client window,
+            // so it is handled before the per-window lookups below.
+            let root = xwm.screen.root;
+            let baselayer_appid_atom = xwm.atoms.GAMESCOPECTRL_BASELAYER_APPID;
+            let baselayer_window_atom = xwm.atoms.GAMESCOPECTRL_BASELAYER_WINDOW;
+            let xwm_id = xwm.id;
+            if n.window == root && (n.atom == baselayer_appid_atom || n.atom == baselayer_window_atom) {
+                let appids = conn
+                    .get_property(false, root, baselayer_appid_atom, AtomEnum::CARDINAL, 0, u32::MAX)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok())
+                    .and_then(|reply| reply.value32().map(|v| v.collect::<Vec<u32>>()))
+                    .unwrap_or_default();
+                let window = conn
+                    .get_property(false, root, baselayer_window_atom, AtomEnum::CARDINAL, 0, 1)
+                    .ok()
+                    .and_then(|cookie| cookie.reply().ok())
+                    .and_then(|reply| reply.value32().and_then(|mut v| v.next()))
+                    .filter(|id| *id != 0);
+                drop(_guard);
+                state.baselayer_changed(xwm_id, appids, window);
+                return Ok(());
+            }
             if n.state == Property::NEW_VALUE && n.atom == xwm.atoms._WL_SELECTION {
                 if let Some(selection) = if xwm.clipboard.incoming.contains_key(&n.window) {
                     Some(&mut xwm.clipboard)
