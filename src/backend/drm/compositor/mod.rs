@@ -677,9 +677,13 @@ impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
 
         let res = surface.test_state(self.build_planes(surface, supports_fencing, true), allow_modeset);
 
-        if res.is_err() {
+        if let Err(ref err) = res {
             // test failed, restore previous state
             *self.plane_state_mut(plane).unwrap() = backup;
+            // Surface the exact kernel atomic-commit rejection (e.g. a plane that
+            // can't scale a src->dst that differs). Off by default; enable with
+            // RUST_LOG=smithay::backend::drm::compositor=debug.
+            debug!(?plane, %err, "atomic plane test rejected; falling back to composition");
         } else {
             self.planes
                 .iter_mut()
