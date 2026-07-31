@@ -345,6 +345,8 @@ pub struct GlesRenderer {
     pub(crate) extensions: Vec<String>,
     is_software: bool,
     capabilities: Vec<Capability>,
+    /// Cleared once a compute dispatch has completed without error.
+    compute_needs_validation: bool,
 
     // shaders
     tex_program: GlesTexProgram,
@@ -697,6 +699,7 @@ impl GlesRenderer {
             is_software,
             gl_version,
             capabilities,
+            compute_needs_validation: true,
 
             tex_program,
             solid_program,
@@ -938,7 +941,9 @@ impl GlesRenderer {
 
             // Drain anything left by earlier work so the check below only sees
             // errors this dispatch caused.
-            while self.gl.GetError() != ffi::NO_ERROR {}
+            if self.compute_needs_validation {
+                while self.gl.GetError() != ffi::NO_ERROR {}
+            }
 
             self.gl.MemoryBarrier(ffi::SHADER_IMAGE_ACCESS_BARRIER_BIT);
             self.gl.UseProgram(program.0);
@@ -948,10 +953,20 @@ impl GlesRenderer {
                 .MemoryBarrier(ffi::TEXTURE_FETCH_BARRIER_BIT | ffi::SHADER_IMAGE_ACCESS_BARRIER_BIT);
             self.gl.UseProgram(0);
 
-            let err = self.gl.GetError();
-            if err != ffi::NO_ERROR {
-                while self.gl.GetError() != ffi::NO_ERROR {}
-                return Err(GlesError::ComputeDispatchError(err));
+            // Only until one dispatch has succeeded. glGetError is a
+            // synchronization point, and a caller dispatching many times per
+            // frame would pay a pipeline stall on each one. The failures worth
+            // catching -- an image format the driver will not accept, a
+            // malformed binding -- are properties of the program and format
+            // rather than of the data, so they surface on the first dispatch or
+            // not at all.
+            if self.compute_needs_validation {
+                let err = self.gl.GetError();
+                if err != ffi::NO_ERROR {
+                    while self.gl.GetError() != ffi::NO_ERROR {}
+                    return Err(GlesError::ComputeDispatchError(err));
+                }
+                self.compute_needs_validation = false;
             }
         }
         Ok(())
