@@ -114,6 +114,52 @@ pub unsafe fn link_program(
     Ok(program)
 }
 
+/// Compiles and links a compute shader program.
+///
+/// Requires a GLES 3.1 or newer context; see `GlesRenderer::supports_compute`.
+///
+/// # Safety
+///
+/// You must call this only when it is safe to compile and link shaders with GL.
+pub unsafe fn link_compute_program(
+    gl: &ffi::Gles2,
+    src: &str,
+) -> Result<ffi::types::GLuint, GlesError> {
+    let shader = compile_shader(gl, ffi::COMPUTE_SHADER, src)?;
+    let program = gl.CreateProgram();
+    gl.AttachShader(program, shader);
+    gl.LinkProgram(program);
+    gl.DetachShader(program, shader);
+    gl.DeleteShader(shader);
+
+    let mut status = ffi::FALSE as i32;
+    gl.GetProgramiv(program, ffi::LINK_STATUS, &mut status as *mut _);
+    if status == ffi::FALSE as i32 {
+        let mut max_len = 0;
+        gl.GetProgramiv(program, ffi::INFO_LOG_LENGTH, &mut max_len as *mut _);
+
+        let mut error = Vec::with_capacity(max_len as usize);
+        let mut len = 0;
+        gl.GetProgramInfoLog(
+            program,
+            max_len as _,
+            &mut len as *mut _,
+            error.as_mut_ptr() as *mut _,
+        );
+        error.set_len(len as usize);
+
+        error!(
+            "[GL] {}",
+            std::str::from_utf8(&error).unwrap_or("<Error Message no utf8>")
+        );
+
+        gl.DeleteProgram(program);
+        return Err(GlesError::ProgramLinkError);
+    }
+
+    Ok(program)
+}
+
 pub(super) unsafe fn texture_program(
     gl: &ffi::Gles2,
     src: &str,

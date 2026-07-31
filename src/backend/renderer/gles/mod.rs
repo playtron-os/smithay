@@ -813,6 +813,131 @@ impl GlesRenderer {
         }
     }
 
+}
+
+/// A linked compute shader program.
+///
+/// Compute runs outside the draw pipeline: it reads and writes textures as
+/// images rather than producing fragments, so results must be made visible with
+/// a memory barrier before anything samples them. `GlesRenderer::dispatch_compute`
+/// handles that.
+///
+/// This is a bare handle and is `Copy`, like the GL name it wraps. It is not
+/// reference counted and does not delete the program when dropped, so it is only
+/// safe to keep for as long as the context that compiled it -- store it in that
+/// context's user data rather than passing it around independently.
+#[derive(Debug, Clone, Copy)]
+pub struct GlesComputeProgram(ffi::types::GLuint);
+
+impl GlesComputeProgram {
+    /// The raw GL program name, for binding additional uniforms.
+    pub fn program(&self) -> ffi::types::GLuint {
+        self.0
+    }
+}
+
+impl GlesRenderer {
+    /// Compiles a compute shader.
+    ///
+    /// Fails with [`GlesError::GLVersionNotSupported`] on a context older than
+    /// GLES 3.1, so callers must keep a non-compute path for drivers that refuse
+    /// to give one.
+    pub fn compile_compute_program(&mut self, src: &str) -> Result<GlesComputeProgram, GlesError> {
+        if !self.supports_compute() {
+            return Err(GlesError::GLVersionNotSupported(version::GLES_3_1));
+        }
+        unsafe {
+            self.egl.make_current()?;
+            shaders::link_compute_program(&self.gl, src).map(GlesComputeProgram)
+        }
+    }
+
+    /// Creates an RGBA8 texture that a compute shader can write to.
+    ///
+    /// This differs from [`Offscreen::create_buffer`] in using immutable storage
+    /// (`glTexStorage2D`). `glBindImageTexture` rejects mutable-format textures,
+    /// so a buffer made by the `Offscreen` impl cannot be a compute target --
+    /// hence the separate constructor rather than a flag on that one.
+    ///
+    /// The result is an ordinary texture otherwise, and can be sampled and bound
+    /// as a render target as usual.
+    pub fn create_compute_buffer(
+        &mut self,
+        size: Size<i32, BufferCoord>,
+    ) -> Result<GlesTexture, GlesError> {
+        if !self.supports_compute() {
+            return Err(GlesError::GLVersionNotSupported(version::GLES_3_1));
+        }
+
+        let tex = unsafe {
+            self.egl.make_current()?;
+            let mut tex = 0;
+            self.gl.GenTextures(1, &mut tex);
+            self.gl.BindTexture(ffi::TEXTURE_2D, tex);
+            self.gl
+                .TexStorage2D(ffi::TEXTURE_2D, 1, ffi::RGBA8, size.w, size.h);
+            // Compute reads these through samplers as well, and the default
+            // minification filter expects mipmaps that immutable single-level
+            // storage does not have.
+            self.gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MIN_FILTER,
+                ffi::LINEAR as i32,
+            );
+            self.gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_MAG_FILTER,
+                ffi::LINEAR as i32,
+            );
+            self.gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_S,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            self.gl.TexParameteri(
+                ffi::TEXTURE_2D,
+                ffi::TEXTURE_WRAP_T,
+                ffi::CLAMP_TO_EDGE as i32,
+            );
+            self.gl.BindTexture(ffi::TEXTURE_2D, 0);
+            tex
+        };
+
+        Ok(unsafe { GlesTexture::from_raw(self, Some(ffi::RGBA8), false, tex, size) })
+    }
+
+    /// Runs a compute program over `groups` workgroups.
+    ///
+    /// `bind` is where the caller attaches its own inputs -- uniforms, and
+    /// textures bound as images with `glBindImageTexture` -- while the program is
+    /// current. After dispatching, a texture-fetch barrier is issued so the
+    /// results are visible to subsequent sampling in the draw pipeline; without
+    /// it a shader could read the previous frame's contents on some drivers.
+    ///
+    /// # Safety
+    ///
+    /// `bind` must only touch GL state belonging to this program, and any image
+    /// it binds must outlive the dispatch.
+    pub unsafe fn dispatch_compute(
+        &mut self,
+        program: &GlesComputeProgram,
+        groups: (u32, u32, u32),
+        bind: impl FnOnce(&ffi::Gles2, ffi::types::GLuint),
+    ) -> Result<(), GlesError> {
+        unsafe {
+            self.egl.make_current()?;
+            self.gl.UseProgram(program.0);
+            bind(&self.gl, program.0);
+            self.gl.DispatchCompute(groups.0, groups.1, groups.2);
+            self.gl
+                .MemoryBarrier(ffi::TEXTURE_FETCH_BARRIER_BIT | ffi::SHADER_IMAGE_ACCESS_BARRIER_BIT);
+            self.gl.UseProgram(0);
+        }
+        Ok(())
+    }
+}
+
+impl GlesRenderer {
     /// Whether this context can run compute shaders.
     ///
     /// True only on a GLES 3.1 or newer context. A driver may refuse to grant
