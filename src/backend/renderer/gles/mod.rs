@@ -910,9 +910,18 @@ impl GlesRenderer {
     ///
     /// `bind` is where the caller attaches its own inputs -- uniforms, and
     /// textures bound as images with `glBindImageTexture` -- while the program is
-    /// current. After dispatching, a texture-fetch barrier is issued so the
-    /// results are visible to subsequent sampling in the draw pipeline; without
-    /// it a shader could read the previous frame's contents on some drivers.
+    /// current.
+    ///
+    /// Barriers are issued on both sides of the dispatch. The one after makes the
+    /// written texels visible to later sampling, in the draw pipeline or in a
+    /// following dispatch. The one before matters when the image being written
+    /// was read earlier in the frame -- image stores are unordered with respect
+    /// to the rest of the pipeline, so without it a store can land while an
+    /// earlier draw is still sampling the same texture.
+    ///
+    /// Errors are checked after dispatching, because a rejected image binding or
+    /// dispatch is otherwise silent: GL would keep reporting success while
+    /// producing nothing, leaving a caller's fallback unreachable.
     ///
     /// # Safety
     ///
@@ -926,12 +935,24 @@ impl GlesRenderer {
     ) -> Result<(), GlesError> {
         unsafe {
             self.egl.make_current()?;
+
+            // Drain anything left by earlier work so the check below only sees
+            // errors this dispatch caused.
+            while self.gl.GetError() != ffi::NO_ERROR {}
+
+            self.gl.MemoryBarrier(ffi::SHADER_IMAGE_ACCESS_BARRIER_BIT);
             self.gl.UseProgram(program.0);
             bind(&self.gl, program.0);
             self.gl.DispatchCompute(groups.0, groups.1, groups.2);
             self.gl
                 .MemoryBarrier(ffi::TEXTURE_FETCH_BARRIER_BIT | ffi::SHADER_IMAGE_ACCESS_BARRIER_BIT);
             self.gl.UseProgram(0);
+
+            let err = self.gl.GetError();
+            if err != ffi::NO_ERROR {
+                while self.gl.GetError() != ffi::NO_ERROR {}
+                return Err(GlesError::ComputeDispatchError(err));
+            }
         }
         Ok(())
     }

@@ -19,6 +19,10 @@ pub enum GlesError {
     /// Required GL functions could not be loaded
     #[error("Failed to load GL functions from EGL")]
     GLFunctionLoaderError,
+
+    /// A compute dispatch reported a GL error.
+    #[error("Compute dispatch failed with GL error {0:#x}")]
+    ComputeDispatchError(u32),
     /// Required GL extension are not supported by the underlying implementation
     #[error(
         "None of the following GL extensions is supported by the underlying GL implementation, at least one is required: {0:?}"
@@ -108,6 +112,7 @@ impl From<GlesError> for SwapBuffersError {
             | x @ GlesError::ContextReset => SwapBuffersError::ContextLost(Box::new(x)),
             GlesError::ContextActivationError(err) => err.into(),
             x @ GlesError::FramebufferBindingError
+            | x @ GlesError::ComputeDispatchError(_)
             | x @ GlesError::BindBufferEGLError(_)
             | x @ GlesError::UnknownPixelFormat
             | x @ GlesError::UnsupportedPixelFormat(_)
