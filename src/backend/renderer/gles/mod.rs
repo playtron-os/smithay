@@ -471,6 +471,20 @@ impl GlesRenderer {
             version::GLES_2_0
         });
 
+        // Compute shaders arrived in GLES 3.1. Report it once at startup: whether a
+        // driver actually grants a 3.1 context is the thing that decides if a
+        // compute path is available at all, and it varies by vendor.
+        info!(
+            "GLES {}.{} context ({} shaders)",
+            gl_version.major,
+            gl_version.minor,
+            if gl_version >= version::GLES_3_1 {
+                "compute-capable"
+            } else {
+                "no compute"
+            }
+        );
+
         let mut capabilities = Vec::new();
         // required for more optimized rendering, otherwise we render in batches
         if gl_version >= version::GLES_3_0
@@ -797,6 +811,15 @@ impl GlesRenderer {
                 Err(GlesError::ContextReset)
             }
         }
+    }
+
+    /// Whether this context can run compute shaders.
+    ///
+    /// True only on a GLES 3.1 or newer context. A driver may refuse to grant
+    /// one, in which case the renderer falls back to 2.0 and this is false, so
+    /// any compute path must have a fragment-shader equivalent.
+    pub fn supports_compute(&self) -> bool {
+        self.gl_version >= version::GLES_3_1
     }
 
     /// Returns the supported [`Capabilities`](Capability) of this renderer.

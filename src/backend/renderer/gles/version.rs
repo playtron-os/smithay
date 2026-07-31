@@ -5,6 +5,7 @@ use std::{
 
 use super::ffi::{self, Gles2};
 
+pub const GLES_3_1: GlVersion = GlVersion::new(3, 1);
 pub const GLES_3_0: GlVersion = GlVersion::new(3, 0);
 pub const GLES_2_0: GlVersion = GlVersion::new(2, 0);
 

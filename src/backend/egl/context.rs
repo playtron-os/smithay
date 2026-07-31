@@ -238,6 +238,8 @@ impl EGLContext {
         };
 
         let mut context_attributes = Vec::with_capacity(16);
+        // Whether we asked for 3.1, so a refusal can be retried at 2.0.
+        let mut requested_gles_3_1 = false;
 
         if let Some((attributes, _)) = config {
             let version = attributes.version;
@@ -265,6 +267,18 @@ impl EGLContext {
                 context_attributes.push(ffi::egl::CONTEXT_CLIENT_VERSION as i32);
                 context_attributes.push(version.0 as i32);
             }
+        } else if display.get_egl_version() >= (1, 5)
+            || display.extensions().iter().any(|s| s == "EGL_KHR_create_context")
+        {
+            // Request 3.1, which is the first version with compute shaders. A 3.1
+            // context is backwards compatible, so nothing that worked on 2.0 stops
+            // working; drivers that cannot provide one fall back below.
+            trace!("Setting CONTEXT_MAJOR_VERSION to 3, CONTEXT_MINOR_VERSION to 1");
+            context_attributes.push(ffi::egl::CONTEXT_MAJOR_VERSION as i32);
+            context_attributes.push(3);
+            context_attributes.push(ffi::egl::CONTEXT_MINOR_VERSION as i32);
+            context_attributes.push(1);
+            requested_gles_3_1 = true;
         } else {
             trace!("Setting CONTEXT_CLIENT_VERSION to 2");
             context_attributes.push(ffi::egl::CONTEXT_CLIENT_VERSION as i32);
@@ -321,8 +335,24 @@ impl EGLContext {
                 )
             })
         };
+        // Retry without the 3.1 request if the driver refuses it: a compositor that
+        // cannot create a context at all is far worse than one without compute.
+        let retry_without_gles_3_1 = |context_attributes: &mut Vec<i32>| {
+            context_attributes.clear();
+            context_attributes.push(ffi::egl::CONTEXT_CLIENT_VERSION as i32);
+            context_attributes.push(2);
+            context_attributes.push(ffi::egl::NONE as i32);
+        };
         let context = match create_context(&context_attributes) {
             Ok(context) => context,
+            Err(err) if requested_gles_3_1 => {
+                warn!(
+                    ?err,
+                    "GLES 3.1 context creation failed; retrying at 2.0 (compute shaders unavailable)"
+                );
+                retry_without_gles_3_1(&mut context_attributes);
+                create_context(&context_attributes).map_err(Error::CreationFailed)?
+            }
             Err(err) if robustness_supported => {
                 warn!(
                     ?err,
