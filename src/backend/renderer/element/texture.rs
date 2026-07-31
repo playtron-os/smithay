@@ -288,6 +288,15 @@ pub struct TextureRenderBuffer<T: Texture> {
 }
 
 impl<T: Texture> TextureRenderBuffer<T> {
+    /// The underlying texture.
+    ///
+    /// Exposed for renderer-specific work that has to address the texture
+    /// directly, such as binding it as a compute image, which the `draw` path
+    /// cannot express.
+    pub fn texture(&self) -> &T {
+        &self.texture
+    }
+
     /// Create [`TextureRenderBuffer`] from an existing texture
     pub fn from_texture<R: Renderer<TextureId = T>>(
         renderer: &R,
