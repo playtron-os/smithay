@@ -175,7 +175,7 @@ use crate::{
 };
 
 use super::{
-    DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
+    DrmDeviceFd, DrmSurface, Framebuffer, PlaneClaim, PlaneInfo, Planes,
     error::AccessError,
     exporter::{ExportBuffer, ExportFramebuffer, gbm::GbmFramebufferExporter, gbm::NodeFilter},
     surface::VrrSupport,
@@ -571,6 +571,15 @@ struct FrameState<B: Buffer, F: Framebuffer> {
 }
 
 impl<B: Buffer, F: Framebuffer> FrameState<B, F> {
+    /// Framebuffers currently assigned to a plane in this frame.
+    #[inline]
+    fn framebuffers(&self) -> impl Iterator<Item = framebuffer::Handle> + '_ {
+        self.planes
+            .iter()
+            .filter_map(|(_, state)| state.config.as_ref())
+            .map(|config| *AsRef::<framebuffer::Handle>::as_ref(&config.buffer))
+    }
+
     #[inline]
     fn is_assigned(&self, handle: plane::Handle) -> bool {
         self.planes
@@ -1096,6 +1105,44 @@ where
 
     debug_flags: DebugFlags,
     span: tracing::Span,
+}
+
+/// `DRM_IOCTL_MODE_CLOSEFB` (kernel 6.8+): drop this file's reference to a framebuffer
+/// WITHOUT the implicit plane/CRTC disable that `RMFB` performs. A framebuffer closed this
+/// way stays alive — and on screen — for as long as a plane scans it out, including after
+/// this fd closes. No binding exists in drm-ffi 0.9 / drm 0.14, so define the ioctl here.
+fn close_framebuffer(fd: &DrmDeviceFd, fb: framebuffer::Handle) -> std::io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    #[repr(C)]
+    struct DrmModeClosefb {
+        fb_id: u32,
+        // Kernel rejects a non-zero pad with EINVAL (kwin shipped that bug for a year).
+        pad: u32,
+    }
+    // _IOWR('d', 0xD0, struct drm_mode_closefb): dir=3, size=8, type=0x64, nr=0xD0.
+    const DRM_IOCTL_MODE_CLOSEFB: libc::c_ulong = (3 << 30) | (8 << 16) | (0x64 << 8) | 0xD0;
+
+    let mut arg = DrmModeClosefb {
+        fb_id: fb.into(),
+        pad: 0,
+    };
+    loop {
+        let ret = unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                DRM_IOCTL_MODE_CLOSEFB,
+                &mut arg as *mut DrmModeClosefb,
+            )
+        };
+        if ret == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::EINTR) {
+            return Err(err);
+        }
+    }
 }
 
 impl<A, F, U, G> DrmCompositor<A, F, U, G>
@@ -2832,6 +2879,42 @@ where
     /// Returns a reference to the underlying drm surface
     pub fn surface(&self) -> &DrmSurface {
         &self.surface
+    }
+
+    /// Hand the presented framebuffers over to the kernel so the last frame stays on
+    /// screen after this process exits (`DRM_IOCTL_MODE_CLOSEFB`, kernel 6.8+).
+    ///
+    /// Call at shutdown, after rendering has stopped. Without this, any framebuffer still
+    /// referenced by a plane when the DRM fd closes is force-disabled by the kernel — the
+    /// black flash on compositor exit. A closed framebuffer instead keeps scanning out
+    /// until the next DRM master replaces it, which is the basis for flicker-free handoff
+    /// between two compositor processes; the next master can also read the frame back
+    /// (`GETFB2` + PRIME) to cross-fade from it.
+    ///
+    /// Covers the current, pending and queued frames, so whichever lands on the planes
+    /// last survives. The subsequent `RMFB` from our buffer `Drop` impls degrades to a
+    /// harmless `ENOENT`. On kernels without CLOSEFB every call fails (`ENOTTY`) and exit
+    /// behaves exactly as before — errors are logged, not returned.
+    pub fn freeze_scanout(&self) {
+        let fd = self.surface.device_fd();
+        let mut seen: Vec<framebuffer::Handle> = Vec::new();
+        let frames = [
+            Some(&self.current_frame),
+            self.pending_frame.as_ref().map(|p| &p.frame),
+            self.queued_frame.as_ref().map(|q| &q.prepared_frame.frame),
+        ];
+        for frame in frames.into_iter().flatten() {
+            for fb in frame.framebuffers() {
+                if seen.contains(&fb) {
+                    continue;
+                }
+                seen.push(fb);
+                match close_framebuffer(fd, fb) {
+                    Ok(()) => info!(?fb, "froze scanout framebuffer for handoff"),
+                    Err(err) => warn!(?fb, "CLOSEFB failed (kernel < 6.8?): {}", err),
+                }
+            }
+        }
     }
 
     /// Get the format of the underlying swapchain
