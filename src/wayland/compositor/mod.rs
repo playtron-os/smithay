@@ -306,6 +306,23 @@ impl RegionAttributes {
         }
         contains
     }
+
+    /// Append a subtract op, compacting when it empties the region.
+    ///
+    /// A subtract containing every rect already in the list leaves nothing, and
+    /// the empty region is the empty list. This matters beyond tidiness:
+    /// `wl_region` has no clear request, so long-lived regions are "cleared" by
+    /// subtracting a huge rect before re-adding (KDE blur clients do this every
+    /// backdrop update) -- and an op list that only ever grows is both a
+    /// permanent leak and a per-read O(n) clone of everything ever pushed.
+    pub(crate) fn push_subtract(&mut self, rect: Rectangle<i32, Logical>) {
+        // all() is true for the empty list: subtracting from nothing stays nothing.
+        if self.rects.iter().all(|(_, r)| rect.contains_rect(*r)) {
+            self.rects.clear();
+        } else {
+            self.rects.push((RectangleKind::Subtract, rect));
+        }
+    }
 }
 
 /// Access the data of a surface tree from bottom to top
@@ -784,5 +801,45 @@ mod tests {
         assert!(!region.contains((0, 0)));
         assert!(region.contains((5, 5)));
         assert!(region.contains((2, 2)));
+    }
+
+    #[test]
+    fn covering_subtract_compacts_to_empty() {
+        let mut region = RegionAttributes {
+            rects: vec![
+                (RectangleKind::Add, Rectangle::from_size((10, 10).into())),
+                (RectangleKind::Subtract, Rectangle::from_size((5, 5).into())),
+                (RectangleKind::Add, Rectangle::new((2, 2).into(), (2, 2).into())),
+            ],
+        };
+        // The pseudo-clear a long-lived region client sends before re-adding.
+        region.push_subtract(Rectangle::new((-10000, -10000).into(), (100000, 100000).into()));
+        assert!(region.rects.is_empty(), "covering subtract empties the op list");
+        assert!(!region.contains((3, 3)));
+
+        // Reused across "frames": the list must not accumulate cleared history.
+        for _ in 0..1000 {
+            region.rects.push((RectangleKind::Add, Rectangle::from_size((10, 10).into())));
+            region.push_subtract(Rectangle::new((-10000, -10000).into(), (100000, 100000).into()));
+        }
+        assert!(region.rects.is_empty());
+    }
+
+    #[test]
+    fn partial_subtract_is_kept() {
+        let mut region = RegionAttributes {
+            rects: vec![(RectangleKind::Add, Rectangle::from_size((10, 10).into()))],
+        };
+        region.push_subtract(Rectangle::from_size((5, 5).into()));
+        assert_eq!(region.rects.len(), 2, "a subtract that leaves area behind is a real op");
+        assert!(!region.contains((0, 0)));
+        assert!(region.contains((7, 7)));
+    }
+
+    #[test]
+    fn subtract_on_empty_stays_empty() {
+        let mut region = RegionAttributes { rects: vec![] };
+        region.push_subtract(Rectangle::from_size((5, 5).into()));
+        assert!(region.rects.is_empty());
     }
 }

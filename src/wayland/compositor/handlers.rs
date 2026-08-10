@@ -397,13 +397,12 @@ where
                     .to_logical(client_scale)
                     .to_i32_round(),
             )),
-            wl_region::Request::Subtract { x, y, width, height } => guard.rects.push((
-                RectangleKind::Subtract,
+            wl_region::Request::Subtract { x, y, width, height } => guard.push_subtract(
                 Rectangle::<i32, Client>::new((x, y).into(), (width, height).into())
                     .to_f64()
                     .to_logical(client_scale)
                     .to_i32_round(),
-            )),
+            ),
             wl_region::Request::Destroy => {
                 // all is handled by our destructor
             }
