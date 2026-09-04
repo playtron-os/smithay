@@ -972,11 +972,30 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
         if let FilterResult::Intercept(val) = filter_result {
             // the filter returned `FilterResult::Intercept(T)`, we do not forward to client
             trace!("Input was intercepted by filter");
+            // The key is withheld, but the modifier state it changed is not secret: a
+            // client told a modifier went down and never that it came up holds it forever.
+            if mods_changed {
+                self.notify_modifiers(data, serial);
+            }
             return Some(val);
         }
 
         self.input_forward(data, keycode, state, serial, time, mods_changed);
         None
+    }
+
+    /// Send the current modifier state to the focused client without forwarding a key.
+    ///
+    /// Needed after [`KeyboardHandle::input_intercept`] swallows a key that changed the
+    /// modifiers: the client would otherwise never learn the modifier was released.
+    pub fn notify_modifiers(&self, data: &mut D, serial: Serial) {
+        let seat = self.get_seat(data);
+        let guard = self.arc.internal.lock().unwrap();
+        let mods = guard.mods_state;
+        let Some((focus, _)) = guard.focus.as_ref() else {
+            return;
+        };
+        focus.modifiers(&seat, data, mods, serial);
     }
 
     /// Update the state of the keyboard without forwarding the event to the focused client
