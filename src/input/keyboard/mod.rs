@@ -973,7 +973,10 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
             // the filter returned `FilterResult::Intercept(T)`, we do not forward to client
             trace!("Input was intercepted by filter");
             // The key is withheld, but the modifier state it changed is not secret: a
-            // client told a modifier went down and never that it came up holds it forever.
+            // client told a modifier went down and never that it came up holds it
+            // forever. Sent without a key, so the "key before modifiers" ordering
+            // below does not apply -- the modifiers event is what clients treat as
+            // authoritative, and no key event accompanies an intercept.
             if mods_changed {
                 self.notify_modifiers(data, serial);
             }
@@ -989,12 +992,17 @@ impl<D: SeatHandler + 'static> KeyboardHandle<D> {
     /// Needed after [`KeyboardHandle::input_intercept`] swallows a key that changed the
     /// modifiers: the client would otherwise never learn the modifier was released.
     pub fn notify_modifiers(&self, data: &mut D, serial: Serial) {
-        let seat = self.get_seat(data);
-        let guard = self.arc.internal.lock().unwrap();
-        let mods = guard.mods_state;
-        let Some((focus, _)) = guard.focus.as_ref() else {
-            return;
+        // Cloned out and the guard dropped before dispatching: a `KeyboardTarget`
+        // is compositor code and may reach back into this handle.
+        let (focus, mods) = {
+            let guard = self.arc.internal.lock().unwrap();
+            let Some((focus, _)) = guard.focus.as_ref() else {
+                return;
+            };
+            (focus.clone(), guard.mods_state)
         };
+
+        let seat = self.get_seat(data);
         focus.modifiers(&seat, data, mods, serial);
     }
 
