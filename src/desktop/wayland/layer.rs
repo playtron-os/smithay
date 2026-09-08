@@ -273,15 +273,22 @@ impl LayerMap {
             );
             trace!("Arranging layers into {:?}", output_rect.size);
 
-            let exclusive_surfaces = self
-                .layers
-                .iter()
-                .filter(|l| matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_)));
-            let non_exclusive_surfaces = self
-                .layers
-                .iter()
-                .filter(|l| !matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_)));
-            for layer in exclusive_surfaces.chain(non_exclusive_surfaces) {
+            // Order by anchor, not by map order: whichever exclusive surface
+            // reserves first takes from the full output, and a full-width bar
+            // has nowhere to go once the sides are gone.
+            let spans_width = |layer: &&LayerSurface| {
+                let anchor = layer.cached_state().anchor;
+                anchor.contains(Anchor::LEFT) && anchor.contains(Anchor::RIGHT)
+            };
+            let is_exclusive =
+                |l: &&LayerSurface| matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_));
+            let exclusive_horizontal = self.layers.iter().filter(|l| is_exclusive(l) && spans_width(l));
+            let exclusive_lateral = self.layers.iter().filter(|l| is_exclusive(l) && !spans_width(l));
+            let non_exclusive_surfaces = self.layers.iter().filter(|l| !is_exclusive(l));
+            for layer in exclusive_horizontal
+                .chain(exclusive_lateral)
+                .chain(non_exclusive_surfaces)
+            {
                 let surface = layer.wl_surface();
 
                 with_surface_tree_downward(
