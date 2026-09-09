@@ -16,10 +16,15 @@ use crate::{
 use indexmap::IndexSet;
 use tracing::{debug_span, trace};
 use wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
-use wayland_server::protocol::wl_surface::{self, WlSurface};
+use wayland_server::{
+    Resource,
+    backend::ObjectId,
+    protocol::wl_surface::{self, WlSurface},
+};
 
 use std::{
     borrow::Cow,
+    collections::HashSet,
     hash::{Hash, Hasher},
     num::Saturating,
     sync::{Arc, Mutex, MutexGuard},
@@ -36,6 +41,8 @@ pub struct LayerMap {
     layers: IndexSet<LayerSurface>,
     output: WeakOutput,
     zone: Rectangle<i32, Logical>,
+    /// Layers whose size and location `arrange` leaves as they are.
+    held: HashSet<ObjectId>,
 }
 
 /// Retrieve a [`LayerMap`] for a given [`Output`].
@@ -53,6 +60,7 @@ pub fn layer_map_for_output(o: &Output) -> MutexGuard<'_, LayerMap> {
         Mutex::new(LayerMap {
             layers: IndexSet::new(),
             output: o.downgrade(),
+            held: HashSet::new(),
             zone: Rectangle::from_size(
                 o.current_mode()
                     .map(|mode| {
@@ -98,6 +106,7 @@ impl LayerMap {
 
     /// Remove a [`LayerSurface`] from this [`LayerMap`].
     pub fn unmap_layer(&mut self, layer: &LayerSurface) {
+        self.held.remove(&layer.wl_surface().id());
         if self.layers.shift_remove(layer) {
             let _ = layer
                 .user_data()
@@ -137,6 +146,24 @@ impl LayerMap {
     /// Return the area of this output, that is not exclusive to any [`LayerSurface`]s.
     pub fn non_exclusive_zone(&self) -> Rectangle<i32, Logical> {
         self.zone
+    }
+
+    /// Keep `layer` at its current size and location across [`LayerMap::arrange`]
+    /// while `hold` is set. Its exclusive zone still counts; only its own
+    /// geometry is left alone, so a compositor can animate the zones around it
+    /// and configure it once at the end.
+    pub fn hold_size(&mut self, layer: &LayerSurface, hold: bool) {
+        let id = layer.wl_surface().id();
+        if hold {
+            self.held.insert(id);
+        } else {
+            self.held.remove(&id);
+        }
+    }
+
+    /// Whether [`LayerMap::hold_size`] is set for `layer`.
+    pub fn is_held(&self, layer: &LayerSurface) -> bool {
+        self.held.contains(&layer.wl_surface().id())
     }
 
     /// Returns the geometry of a given mapped [`LayerSurface`].
@@ -414,6 +441,11 @@ impl LayerMap {
                         Some(_) => unreachable!(),
                         None => {}
                     }
+                }
+
+                if self.held.contains(&surface.id()) {
+                    trace!("Layer is held; leaving its geometry alone");
+                    continue;
                 }
 
                 let size = Size::new(size.w.0.max(0), size.h.0.max(0));
