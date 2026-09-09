@@ -273,20 +273,19 @@ impl LayerMap {
             );
             trace!("Arranging layers into {:?}", output_rect.size);
 
-            // Order by anchor, not by map order: whichever exclusive surface
-            // reserves first takes from the full output, and a full-width bar
-            // has nowhere to go once the sides are gone.
+            // Order by anchor, not by map order: a side panel takes its column
+            // first, and a full-width bar fits in what is left.
             let spans_width = |layer: &&LayerSurface| {
                 let anchor = layer.cached_state().anchor;
                 anchor.contains(Anchor::LEFT) && anchor.contains(Anchor::RIGHT)
             };
             let is_exclusive =
                 |l: &&LayerSurface| matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_));
-            let exclusive_horizontal = self.layers.iter().filter(|l| is_exclusive(l) && spans_width(l));
             let exclusive_lateral = self.layers.iter().filter(|l| is_exclusive(l) && !spans_width(l));
+            let exclusive_horizontal = self.layers.iter().filter(|l| is_exclusive(l) && spans_width(l));
             let non_exclusive_surfaces = self.layers.iter().filter(|l| !is_exclusive(l));
-            for layer in exclusive_horizontal
-                .chain(exclusive_lateral)
+            for layer in exclusive_lateral
+                .chain(exclusive_horizontal)
                 .chain(non_exclusive_surfaces)
             {
                 let surface = layer.wl_surface();
