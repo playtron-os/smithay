@@ -24,7 +24,7 @@ use wayland_server::{
 
 use std::{
     borrow::Cow,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     hash::{Hash, Hasher},
     num::Saturating,
     sync::{Arc, Mutex, MutexGuard},
@@ -43,6 +43,8 @@ pub struct LayerMap {
     zone: Rectangle<i32, Logical>,
     /// Layers whose size and location `arrange` leaves as they are.
     held: HashSet<ObjectId>,
+    /// How much of a layer's exclusive zone is kept from windows, where less than all of it.
+    reserve_caps: HashMap<ObjectId, u32>,
 }
 
 /// Retrieve a [`LayerMap`] for a given [`Output`].
@@ -61,6 +63,7 @@ pub fn layer_map_for_output(o: &Output) -> MutexGuard<'_, LayerMap> {
             layers: IndexSet::new(),
             output: o.downgrade(),
             held: HashSet::new(),
+            reserve_caps: HashMap::new(),
             zone: Rectangle::from_size(
                 o.current_mode()
                     .map(|mode| {
@@ -107,6 +110,7 @@ impl LayerMap {
     /// Remove a [`LayerSurface`] from this [`LayerMap`].
     pub fn unmap_layer(&mut self, layer: &LayerSurface) {
         self.held.remove(&layer.wl_surface().id());
+        self.reserve_caps.remove(&layer.wl_surface().id());
         if self.layers.shift_remove(layer) {
             let _ = layer
                 .user_data()
@@ -164,6 +168,22 @@ impl LayerMap {
     /// Whether [`LayerMap::hold_size`] is set for `layer`.
     pub fn is_held(&self, layer: &LayerSurface) -> bool {
         self.held.contains(&layer.wl_surface().id())
+    }
+
+    /// Cap how much of `layer`'s exclusive zone is kept from windows (what
+    /// [`LayerMap::non_exclusive_zone`] loses to it). Layers arranged after it
+    /// still make way for all of it, so a panel can grow over the windows
+    /// without covering a bar beside it.
+    pub fn set_reserve_cap(&mut self, layer: &LayerSurface, cap: Option<u32>) {
+        let id = layer.wl_surface().id();
+        match cap {
+            Some(cap) => {
+                self.reserve_caps.insert(id, cap);
+            }
+            None => {
+                self.reserve_caps.remove(&id);
+            }
+        }
     }
 
     /// Returns the geometry of a given mapped [`LayerSurface`].
@@ -298,6 +318,8 @@ impl LayerMap {
                 Point::new(Saturating(zone.loc.x), Saturating(zone.loc.y)),
                 Size::new(Saturating(zone.size.w), Saturating(zone.size.h)),
             );
+            // What windows get: the same, less any capped reserve.
+            let mut reserved = zone;
             trace!("Arranging layers into {:?}", output_rect.size);
 
             // Order by anchor, not by map order: a side panel takes its column
@@ -418,28 +440,22 @@ impl LayerMap {
                 let location: Point<i32, Logical> = (x.0, y.0).into();
 
                 if let ExclusiveZone::Exclusive(amount) = data.exclusive_zone {
-                    let amount = Saturating(amount as i32);
-
-                    match effective_exclusive_edge(&data) {
-                        Some(Anchor::TOP) => {
-                            let sum = amount + Saturating(data.margin.top);
-                            zone.loc.y += sum;
-                            zone.size.h -= sum;
-                        }
-                        Some(Anchor::BOTTOM) => {
-                            zone.size.h -= amount + Saturating(data.margin.bottom);
-                        }
-                        Some(Anchor::LEFT) => {
-                            let sum = amount + Saturating(data.margin.left);
-                            zone.loc.x += sum;
-                            zone.size.w -= sum;
-                        }
-                        Some(Anchor::RIGHT) => {
-                            zone.size.w -= amount + Saturating(data.margin.right);
-                        }
-                        // Exclusive edge is always exactly one edge
-                        Some(_) => unreachable!(),
-                        None => {}
+                    // Exclusive edge is always exactly one edge
+                    if let Some(edge) = effective_exclusive_edge(&data) {
+                        let margin = Saturating(match edge {
+                            Anchor::TOP => data.margin.top,
+                            Anchor::BOTTOM => data.margin.bottom,
+                            Anchor::LEFT => data.margin.left,
+                            Anchor::RIGHT => data.margin.right,
+                            _ => unreachable!(),
+                        });
+                        let amount = Saturating(amount as i32);
+                        let kept = self
+                            .reserve_caps
+                            .get(&surface.id())
+                            .map_or(amount, |cap| Saturating(amount.0.min(*cap as i32)));
+                        take_from_edge(&mut zone, edge, amount + margin);
+                        take_from_edge(&mut reserved, edge, kept + margin);
                     }
                 }
 
@@ -484,8 +500,8 @@ impl LayerMap {
             }
 
             let zone = Rectangle::new(
-                Point::new(zone.loc.x.0, zone.loc.y.0),
-                Size::new(zone.size.w.0.max(0), zone.size.h.0.max(0)),
+                Point::new(reserved.loc.x.0, reserved.loc.y.0),
+                Size::new(reserved.size.w.0.max(0), reserved.size.h.0.max(0)),
             );
             trace!("Remaining zone {:?}", zone);
             self.zone = zone;
@@ -513,6 +529,23 @@ impl LayerMap {
     #[allow(clippy::len_without_is_empty)] //we don't need is_empty on that struct for now, mark as allow
     pub fn len(&self) -> usize {
         self.layers.len()
+    }
+}
+
+/// Give up `amount` of `rect` along `edge`.
+fn take_from_edge(rect: &mut Rectangle<Saturating<i32>, Logical>, edge: Anchor, amount: Saturating<i32>) {
+    match edge {
+        Anchor::TOP => {
+            rect.loc.y += amount;
+            rect.size.h -= amount;
+        }
+        Anchor::BOTTOM => rect.size.h -= amount,
+        Anchor::LEFT => {
+            rect.loc.x += amount;
+            rect.size.w -= amount;
+        }
+        Anchor::RIGHT => rect.size.w -= amount,
+        _ => unreachable!(),
     }
 }
 
