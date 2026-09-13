@@ -330,10 +330,26 @@ impl LayerMap {
             };
             let is_exclusive =
                 |l: &&LayerSurface| matches!(l.effective_exclusive_zone(), ExclusiveZone::Exclusive(_));
-            let exclusive_lateral = self.layers.iter().filter(|l| is_exclusive(l) && !spans_width(l));
+            // Among lateral surfaces the higher layer takes the screen edge, so a
+            // panel on Top sits flush against it and a Bottom-layer desktop margin
+            // falls inside it instead of pushing the panel inward. Surfaces
+            // sharing a layer keep map order.
+            let depth = |l: &LayerSurface| match l.layer() {
+                WlrLayer::Overlay => 0u8,
+                WlrLayer::Top => 1,
+                WlrLayer::Bottom => 2,
+                WlrLayer::Background => 3,
+            };
+            let mut exclusive_lateral = self
+                .layers
+                .iter()
+                .filter(|l| is_exclusive(l) && !spans_width(l))
+                .collect::<Vec<_>>();
+            exclusive_lateral.sort_by_key(|l| depth(l));
             let exclusive_horizontal = self.layers.iter().filter(|l| is_exclusive(l) && spans_width(l));
             let non_exclusive_surfaces = self.layers.iter().filter(|l| !is_exclusive(l));
             for layer in exclusive_lateral
+                .into_iter()
                 .chain(exclusive_horizontal)
                 .chain(non_exclusive_surfaces)
             {
