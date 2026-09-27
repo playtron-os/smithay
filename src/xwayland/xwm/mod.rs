@@ -636,6 +636,11 @@ pub struct X11Wm {
 
     is_showing_desktop: bool,
 
+    // The managed window holding X input focus, and the window `_NET_ACTIVE_WINDOW` stays on
+    // instead while one is set.
+    focused_window: Option<X11Window>,
+    active_window_override: Option<X11Window>,
+
     pub(super) focus_release: FocusReleaseHandle,
 
     span: tracing::Span,
@@ -1086,6 +1091,8 @@ impl X11Wm {
             client_list: Vec::new(),
             client_list_stacking: Vec::new(),
             is_showing_desktop: false,
+            focused_window: None,
+            active_window_override: None,
             focus_release,
             span,
             prop_work_tx,
@@ -1525,6 +1532,34 @@ impl X11Wm {
     /// Returns the state of the "showing desktop" flag
     pub fn is_showing_desktop(&self) -> bool {
         self.is_showing_desktop
+    }
+
+    /// Keeps `_NET_ACTIVE_WINDOW` on `window` while X input focus moves elsewhere, as gamescope
+    /// does for a game under its overlay: Wine deactivates a window that stops being the active
+    /// one, and a fullscreen game then minimizes itself. `None` hands the property back to the
+    /// focused window.
+    pub fn set_active_window_override(&mut self, window: Option<&X11Surface>) -> Result<(), ConnectionError> {
+        let window = window.map(X11Surface::window_id);
+        if window == self.active_window_override {
+            return Ok(());
+        }
+        self.active_window_override = window;
+        self.write_active_window()
+    }
+
+    fn write_active_window(&self) -> Result<(), ConnectionError> {
+        let active = self
+            .active_window_override
+            .or(self.focused_window)
+            .unwrap_or(x11rb::NONE);
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.screen.root,
+            self.atoms._NET_ACTIVE_WINDOW,
+            AtomEnum::WINDOW,
+            &[active],
+        )?;
+        self.conn.flush()
     }
 
     fn colormap_for_visual(&self, visual: Visualid) -> Result<Colormap, ReplyOrIdError> {
@@ -2006,6 +2041,14 @@ where
             xwm.clipboard.window_destroyed(&n.window, loop_handle);
             xwm.primary.window_destroyed(&n.window, loop_handle);
             xwm.dnd.window_destroyed(&n.window, loop_handle);
+
+            if xwm.focused_window == Some(n.window) {
+                xwm.focused_window = None;
+            }
+            if xwm.active_window_override == Some(n.window) {
+                xwm.active_window_override = None;
+                xwm.write_active_window()?;
+            }
 
             if let Some(pos) = xwm.windows.iter().position(|x| x.window_id() == n.window) {
                 let surface = xwm.windows.remove(pos);
@@ -2530,24 +2573,20 @@ where
         }
         Event::FocusIn(n) => {
             if xwm.windows.iter().any(|x| x.window_id() == n.event) {
-                conn.change_property32(
-                    PropMode::REPLACE,
-                    xwm.screen.root,
-                    xwm.atoms._NET_ACTIVE_WINDOW,
-                    AtomEnum::WINDOW,
-                    &[n.event],
-                )?;
+                xwm.focused_window = Some(n.event);
+                if xwm.active_window_override.is_none() {
+                    xwm.write_active_window()?;
+                }
             }
         }
         Event::FocusOut(n) if n.detail == NotifyDetail::NONE => {
             if xwm.windows.iter().any(|x| x.window_id() == n.event) {
-                conn.change_property32(
-                    PropMode::REPLACE,
-                    xwm.screen.root,
-                    xwm.atoms._NET_ACTIVE_WINDOW,
-                    AtomEnum::WINDOW,
-                    &[x11rb::NONE],
-                )?;
+                if xwm.focused_window == Some(n.event) {
+                    xwm.focused_window = None;
+                }
+                if xwm.active_window_override.is_none() {
+                    xwm.write_active_window()?;
+                }
             }
         }
         Event::ClientMessage(msg) => {
