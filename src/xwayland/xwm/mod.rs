@@ -652,6 +652,27 @@ pub struct X11Wm {
     // (closing the channel causes the worker to exit, then the JoinHandle can join).
     prop_work_tx: std::sync::mpsc::SyncSender<(X11Surface, Atom)>,
     _prop_worker: std::thread::JoinHandle<()>,
+
+    // Last, so the sources go after everything above.
+    sources: SourceGuard,
+}
+
+/// Removes a WM's event sources when it is dropped: a compositor can run more
+/// than one, and an event of one already gone would ask for it again.
+struct SourceGuard(Option<Box<dyn FnOnce()>>);
+
+impl Drop for SourceGuard {
+    fn drop(&mut self) {
+        if let Some(remove) = self.0.take() {
+            remove();
+        }
+    }
+}
+
+impl std::fmt::Debug for SourceGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SourceGuard").finish_non_exhaustive()
+    }
 }
 
 impl Drop for X11Wm {
@@ -1049,9 +1070,10 @@ impl X11Wm {
         let wm_window = OwnedX11Window::new(win, &conn);
 
         let (focus_release, focus_release_source) = FocusReleaseHandle::new(&conn)?;
+        let mut sources = Vec::with_capacity(3);
         {
             let release = focus_release.clone();
-            handle.insert_source(focus_release_source, move |_, _, _| release.dispatch())?;
+            sources.push(handle.insert_source(focus_release_source, move |_, _, _| release.dispatch())?);
         }
 
         // Spin up the async property fetch worker.  PropertyNotify events are forwarded
@@ -1063,14 +1085,16 @@ impl X11Wm {
             .name("xwm-prop-fetch".into())
             .spawn(move || prop_fetch_worker(prop_work_rx, prop_result_tx))
             .map_err(|e| format!("failed to spawn xwm property fetch thread: {e}"))?;
-        handle.insert_source(prop_result_channel, move |event, _, data: &mut D| {
-            if let calloop::channel::Event::Msg((surface, prop)) = event {
-                data.property_notify(id, surface, prop);
-            }
-        })?;
+        sources.push(
+            handle.insert_source(prop_result_channel, move |event, _, data: &mut D| {
+                if let calloop::channel::Event::Msg((surface, prop)) = event {
+                    data.property_notify(id, surface, prop);
+                }
+            })?,
+        );
 
         drop(_guard);
-        let wm = Self {
+        let mut wm = Self {
             id,
             conn,
             client_scale,
@@ -1097,11 +1121,12 @@ impl X11Wm {
             span,
             prop_work_tx,
             _prop_worker,
+            sources: SourceGuard(None),
         };
 
         let event_handle = handle.clone();
         let dh = dh.clone();
-        handle.insert_source(source, move |event, _, data| match event {
+        sources.push(handle.insert_source(source, move |event, _, data| match event {
             calloop::channel::Event::Msg(event) => {
                 if let Err(err) = handle_event(&event_handle, &dh, data, id, event) {
                     warn!(id = id.0, err = ?err, "Failed to handle X11 event");
@@ -1110,7 +1135,13 @@ impl X11Wm {
             calloop::channel::Event::Closed => {
                 data.disconnected(id);
             }
-        })?;
+        })?);
+        let remove_handle = handle.clone();
+        wm.sources = SourceGuard(Some(Box::new(move || {
+            for token in sources {
+                remove_handle.remove(token);
+            }
+        })));
         Ok(wm)
     }
 
