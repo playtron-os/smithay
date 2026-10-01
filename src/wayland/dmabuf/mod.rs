@@ -453,7 +453,14 @@ impl DmabufFeedback {
 
         for tranche in self.0.tranches.iter() {
             feedback.tranche_target_device(tranche.target_device.to_ne_bytes().to_vec());
-            feedback.tranche_flags(tranche.flags);
+            // Before version 6 only `scanout` exists. A client bound at an older
+            // version that checks the bits, as Rust's bindings do, rejects
+            // `sampling` and disconnects.
+            let mut flags = tranche.flags;
+            if feedback.version() <= 5 {
+                flags &= zwp_linux_dmabuf_feedback_v1::TrancheFlags::Scanout;
+            }
+            feedback.tranche_flags(flags);
             feedback.tranche_formats(
                 tranche
                     .indices
