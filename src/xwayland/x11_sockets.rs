@@ -44,9 +44,31 @@ pub(crate) fn prepare_x11_sockets(
     ))
 }
 
+/// Reserve a free X11 display number without opening any socket for it.
+///
+/// For a server that listens only on sockets its compositor hands it: the
+/// number still names files the server writes, such as compiled keymaps, so it
+/// must not be shared with another server.
+pub(crate) fn reserve_display() -> Result<X11Lock, std::io::Error> {
+    (0..1024)
+        .find_map(|d| X11Lock::grab(d).ok())
+        .map(|mut lock| {
+            lock.owns_socket = false;
+            lock
+        })
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "Could not find a free display number for the XServer.",
+            )
+        })
+}
+
 #[derive(Debug)]
 pub(crate) struct X11Lock {
     display: u32,
+    /// Whether `/tmp/.X11-unix/X<display>` is ours to remove.
+    owns_socket: bool,
 }
 
 impl X11Lock {
@@ -73,7 +95,10 @@ impl X11Lock {
                 } else {
                     debug!(display = number, "X11 lock acquired");
                     // we got the lockfile and wrote our pid to it, all is good
-                    Ok(X11Lock { display: number })
+                    Ok(X11Lock {
+                        display: number,
+                        owns_socket: true,
+                    })
                 }
             }
             Err(_) => {
@@ -124,8 +149,10 @@ impl Drop for X11Lock {
     fn drop(&mut self) {
         info!("Cleaning up X11 lock.");
         // Cleanup all the X11 files
-        if let Err(e) = ::std::fs::remove_file(format!("/tmp/.X11-unix/X{}", self.display)) {
-            warn!(error = ?e, "Failed to remove X11 socket");
+        if self.owns_socket {
+            if let Err(e) = ::std::fs::remove_file(format!("/tmp/.X11-unix/X{}", self.display)) {
+                warn!(error = ?e, "Failed to remove X11 socket");
+            }
         }
         if let Err(e) = ::std::fs::remove_file(format!("/tmp/.X{}-lock", self.display)) {
             warn!(error = ?e, "Failed to remove X11 lockfile");

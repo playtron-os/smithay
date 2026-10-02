@@ -18,7 +18,7 @@ use wayland_server::{Client, DisplayHandle};
 
 use crate::{utils::user_data::UserDataMap, wayland::compositor::CompositorClientState};
 
-use super::x11_sockets::{X11Lock, prepare_x11_sockets};
+use super::x11_sockets::{X11Lock, prepare_x11_sockets, reserve_display};
 
 /// A handle to a running XWayland process. Using XWayland as an xserver for
 /// X11-based clients requires two connections: one wayland socket, where
@@ -130,10 +130,84 @@ impl XWayland {
         A: AsRef<OsStr>,
         F: FnOnce(&UserDataMap),
     {
+        let (lock, listen_sockets) = prepare_x11_sockets(display.into(), open_abstract_socket)?;
+        let listen_sockets = listen_sockets.into_iter().map(OwnedFd::from).collect();
+        Self::spawn_with(
+            dh,
+            lock,
+            listen_sockets,
+            envs,
+            extra_args,
+            stdout,
+            stderr,
+            user_data,
+        )
+    }
+
+    /// Spawns an XWayland server instance that listens only on `listeners`:
+    /// unix sockets the caller has bound and called `listen` on. Each is handed
+    /// to the server with `-listenfd`; the caller keeps its own copies, so a
+    /// socket can outlive the server and be handed to the next one.
+    ///
+    /// Nothing is created under `/tmp/.X11-unix`, and no abstract socket is
+    /// opened, so only whoever can reach one of `listeners` can connect. A
+    /// display number is still reserved by lock file: the server names files
+    /// it writes after it, and two servers must not share them.
+    ///
+    /// The other arguments and the result are as for [`XWayland::spawn`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn_on<K, V, I, A, AI, F>(
+        dh: &DisplayHandle,
+        listeners: impl IntoIterator<Item = OwnedFd>,
+        envs: I,
+        extra_args: AI,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        AI: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
+        let lock = reserve_display()?;
+        Self::spawn_with(
+            dh,
+            lock,
+            listeners.into_iter().collect(),
+            envs,
+            extra_args,
+            stdout,
+            stderr,
+            user_data,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_with<K, V, I, A, AI, F>(
+        dh: &DisplayHandle,
+        lock: X11Lock,
+        listen_sockets: Vec<OwnedFd>,
+        envs: I,
+        extra_args: AI,
+        stdout: impl Into<std::process::Stdio>,
+        stderr: impl Into<std::process::Stdio>,
+        user_data: F,
+    ) -> std::io::Result<(Self, Client)>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+        AI: IntoIterator<Item = A>,
+        A: AsRef<OsStr>,
+        F: FnOnce(&UserDataMap),
+    {
         let (x_wm_x11, x_wm_me) = UnixStream::pair()?;
         let (wl_x11, wl_me) = UnixStream::pair()?;
 
-        let (lock, listen_sockets) = prepare_x11_sockets(display.into(), open_abstract_socket)?;
         let display_number = lock.display_number();
 
         // XWayland writes the the display number and a newline to this pipe when it's ready.

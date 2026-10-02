@@ -152,7 +152,9 @@ const VERSION: u32 = 1;
 #[derive(Debug, Clone)]
 pub struct XWaylandShellState {
     global: GlobalId,
-    by_serial: HashMap<u64, WlSurface>,
+    /// Keyed by the WM too: every Xwayland numbers its surfaces from the same
+    /// start, so with more than one running, a serial alone names several.
+    by_serial: HashMap<(XwmId, u64), WlSurface>,
 }
 
 impl XWaylandShellState {
@@ -177,9 +179,9 @@ impl XWaylandShellState {
         self.global.clone()
     }
 
-    /// Retrieves the surface for a given serial.
-    pub fn surface_for_serial(&self, serial: u64) -> Option<WlSurface> {
-        self.by_serial.get(&serial).cloned()
+    /// Retrieves the surface the Xwayland of `xwm` gave a serial.
+    pub fn surface_for_serial(&self, xwm: XwmId, serial: u64) -> Option<WlSurface> {
+        self.by_serial.get(&(xwm, serial)).cloned()
     }
 }
 
@@ -350,7 +352,7 @@ where
     };
 
     let wl_surface = XWaylandShellHandler::xwayland_shell_state(state)
-        .surface_for_serial(serial)
+        .surface_for_serial(xwm_id, serial)
         .filter(|s| s.is_alive())
         .clone();
 
@@ -365,7 +367,7 @@ where
     // Remove the pending entry now that we're committing to the association.
     XWaylandShellHandler::xwayland_shell_state(state)
         .by_serial
-        .remove(&serial);
+        .remove(&(xwm_id, serial));
 
     window.set_wl_surface(state, Some(wl_surface.clone()));
     XWaylandShellHandler::surface_associated(state, xwm_id, wl_surface, window.clone());
@@ -400,11 +402,12 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
     let Some(xwm_id) = client
         .get_data::<XWaylandClientData>()
         .and_then(|data| data.user_data().get::<XwmId>())
+        .copied()
     else {
         return;
     };
 
-    let xwm = XwmHandler::xwm_state(state, *xwm_id);
+    let xwm = XwmHandler::xwm_state(state, xwm_id);
 
     // This handles the case that the serial was set on the X11
     // window before surface. To handle the other case, we look for
@@ -416,7 +419,7 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
             .find(|x| x.window_id() == window || x.mapped_window_id() == Some(window))
             .cloned()
         {
-            if !XWaylandShellHandler::filter_surface_association(state, *xwm_id, surface, &xsurface) {
+            if !XWaylandShellHandler::filter_surface_association(state, xwm_id, surface, &xsurface) {
                 // Compositor rejected this association (e.g. unmapped override-redirect phantom).
                 // Mark the surface so the commit handler can fast-path past expensive shell scans.
                 compositor::with_states(surface, |states| {
@@ -433,7 +436,7 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
 
             xsurface.set_wl_surface(state, Some(surface.clone()));
 
-            XWaylandShellHandler::surface_associated(state, *xwm_id, surface.clone(), xsurface);
+            XWaylandShellHandler::surface_associated(state, xwm_id, surface.clone(), xsurface);
         } else {
             warn!(
                 window,
@@ -444,13 +447,17 @@ fn serial_commit_hook<D: XWaylandShellHandler + XwmHandler + SeatHandler + 'stat
     } else {
         // this is necessary for the atom-handler to look up the matching surface
         let shell_state = XWaylandShellHandler::xwayland_shell_state(state);
-        if shell_state.by_serial.insert(serial, surface.clone()).is_none() {
+        if shell_state
+            .by_serial
+            .insert((xwm_id, serial), surface.clone())
+            .is_none()
+        {
             // Only register the cleanup hook on the first insertion — the serial is now
             // cleared from pending state, so subsequent commits won't reach this branch.
             compositor::add_destruction_hook::<D, _>(surface, move |state, _| {
                 XWaylandShellHandler::xwayland_shell_state(state)
                     .by_serial
-                    .remove(&serial);
+                    .remove(&(xwm_id, serial));
             });
         }
     }
