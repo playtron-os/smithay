@@ -1522,13 +1522,13 @@ impl X11Wm {
             let name =
                 std::str::from_utf8(&info.name).expect("X11 protocol violation, output name not utf-8");
             if name == output.name() {
-                // we got our output
+                // we got our output, which may be the primary already
                 if output_xid != current_primary {
                     let cookie = self.conn.randr_set_output_primary(self.screen.root, output_xid)?;
                     self.sequences_to_ignore
                         .push(Reverse(cookie.sequence_number() as u16));
-                    return Ok(());
                 }
+                return Ok(());
             }
         }
 
