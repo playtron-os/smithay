@@ -815,7 +815,6 @@ impl GlesRenderer {
             }
         }
     }
-
 }
 
 /// A linked compute shader program.
@@ -864,10 +863,7 @@ impl GlesRenderer {
     ///
     /// The result is an ordinary texture otherwise, and can be sampled and bound
     /// as a render target as usual.
-    pub fn create_compute_buffer(
-        &mut self,
-        size: Size<i32, BufferCoord>,
-    ) -> Result<GlesTexture, GlesError> {
+    pub fn create_compute_buffer(&mut self, size: Size<i32, BufferCoord>) -> Result<GlesTexture, GlesError> {
         if !self.supports_compute() {
             return Err(GlesError::GLVersionNotSupported(version::GLES_3_1));
         }
@@ -882,26 +878,14 @@ impl GlesRenderer {
             // Compute reads these through samplers as well, and the default
             // minification filter expects mipmaps that immutable single-level
             // storage does not have.
-            self.gl.TexParameteri(
-                ffi::TEXTURE_2D,
-                ffi::TEXTURE_MIN_FILTER,
-                ffi::LINEAR as i32,
-            );
-            self.gl.TexParameteri(
-                ffi::TEXTURE_2D,
-                ffi::TEXTURE_MAG_FILTER,
-                ffi::LINEAR as i32,
-            );
-            self.gl.TexParameteri(
-                ffi::TEXTURE_2D,
-                ffi::TEXTURE_WRAP_S,
-                ffi::CLAMP_TO_EDGE as i32,
-            );
-            self.gl.TexParameteri(
-                ffi::TEXTURE_2D,
-                ffi::TEXTURE_WRAP_T,
-                ffi::CLAMP_TO_EDGE as i32,
-            );
+            self.gl
+                .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
+            self.gl
+                .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
+            self.gl
+                .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_S, ffi::CLAMP_TO_EDGE as i32);
+            self.gl
+                .TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_WRAP_T, ffi::CLAMP_TO_EDGE as i32);
             self.gl.BindTexture(ffi::TEXTURE_2D, 0);
             tex
         };

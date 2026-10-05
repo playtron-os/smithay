@@ -121,10 +121,7 @@ pub unsafe fn link_program(
 /// # Safety
 ///
 /// You must call this only when it is safe to compile and link shaders with GL.
-pub unsafe fn link_compute_program(
-    gl: &ffi::Gles2,
-    src: &str,
-) -> Result<ffi::types::GLuint, GlesError> {
+pub unsafe fn link_compute_program(gl: &ffi::Gles2, src: &str) -> Result<ffi::types::GLuint, GlesError> {
     let shader = compile_shader(gl, ffi::COMPUTE_SHADER, src)?;
     let program = gl.CreateProgram();
     gl.AttachShader(program, shader);
