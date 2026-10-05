@@ -128,11 +128,16 @@ pub struct ForeignToplevelHandle {
 }
 
 impl ForeignToplevelHandle {
-    fn new(title: String, app_id: String, instances: Vec<Weak<ExtForeignToplevelHandleV1>>) -> Self {
+    fn new(
+        title: String,
+        app_id: String,
+        identifier: String,
+        instances: Vec<Weak<ExtForeignToplevelHandleV1>>,
+    ) -> Self {
         Self {
             inner: Arc::new((
                 Mutex::new(ForeignToplevelHandleInner {
-                    identifier: Alphanumeric.sample_string(&mut rand::rng(), 32),
+                    identifier,
                     title,
                     app_id,
                     instances,
@@ -337,9 +342,47 @@ impl ForeignToplevelListState {
     where
         D: ForeignToplevelListHandler + Dispatch<ExtForeignToplevelHandleV1, ForeignToplevelHandle>,
     {
+        self.new_toplevel_with_identifier::<D>(
+            title,
+            app_id,
+            Alphanumeric.sample_string(&mut rand::rng(), 32),
+        )
+    }
+
+    /// Announce a toplevel using its existing mapped-lifetime identifier.
+    /// Reuse it only when re-advertising the same still-mapped toplevel, never after unmapping.
+    ///
+    /// # Panics
+    /// Panics if the identifier is empty, longer than 32 printable ASCII bytes,
+    /// or already belongs to an open handle in this list.
+    pub fn new_toplevel_with_identifier<D>(
+        &mut self,
+        title: impl Into<String>,
+        app_id: impl Into<String>,
+        identifier: impl Into<String>,
+    ) -> ForeignToplevelHandle
+    where
+        D: ForeignToplevelListHandler + Dispatch<ExtForeignToplevelHandleV1, ForeignToplevelHandle>,
+    {
+        let identifier = identifier.into();
+        assert!(
+            !identifier.is_empty()
+                && identifier.len() <= 32
+                && identifier.bytes().all(|byte| (32..=126).contains(&byte)),
+            "a toplevel identifier must contain 1–32 printable ASCII bytes"
+        );
+        assert!(
+            !self
+                .toplevels
+                .iter()
+                .filter_map(ForeignToplevelWeakHandle::upgrade)
+                .any(|handle| !handle.is_closed() && handle.identifier() == identifier),
+            "a toplevel identifier must be unique among open handles"
+        );
         let handle = ForeignToplevelHandle::new(
             title.into(),
             app_id.into(),
+            identifier,
             Vec::with_capacity(self.list_instances.len()),
         );
 
@@ -502,5 +545,57 @@ impl<D: ForeignToplevelListHandler> Dispatch2<ExtForeignToplevelHandleV1, D> for
 
     fn destroyed(&self, _state: &mut D, _client: ClientId, resource: &ExtForeignToplevelHandleV1) {
         self.remove_instance(resource);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct State {
+        list: ForeignToplevelListState,
+    }
+
+    crate::delegate_dispatch2!(State);
+
+    impl ForeignToplevelListHandler for State {
+        fn foreign_toplevel_list_state(&mut self) -> &mut ForeignToplevelListState {
+            &mut self.list
+        }
+    }
+
+    #[test]
+    fn readvertising_preserves_identity_without_reviving_closed_handles() {
+        let display = wayland_server::Display::<State>::new().unwrap();
+        let mut state = State {
+            list: ForeignToplevelListState::new::<State>(&display.handle()),
+        };
+        let first = state.list.new_toplevel::<State>("First title", "app");
+        let identifier = first.identifier();
+        state.list.remove_toplevel(&first);
+        let again = state
+            .list
+            .new_toplevel_with_identifier::<State>("New title", "app", &identifier);
+        assert_eq!(again.identifier(), identifier);
+        assert!(first.is_closed());
+        assert!(!again.is_closed());
+        assert_eq!(again.title(), "New title");
+        let other = state.list.new_toplevel::<State>("Other", "app");
+        assert_ne!(other.identifier(), identifier);
+    }
+
+    #[test]
+    #[should_panic(expected = "unique among open handles")]
+    fn two_open_toplevels_cannot_share_an_identifier() {
+        let display = wayland_server::Display::<State>::new().unwrap();
+        let mut state = State {
+            list: ForeignToplevelListState::new::<State>(&display.handle()),
+        };
+        let _first = state
+            .list
+            .new_toplevel_with_identifier::<State>("First", "app", "same");
+        state
+            .list
+            .new_toplevel_with_identifier::<State>("Second", "app", "same");
     }
 }
