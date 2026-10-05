@@ -580,17 +580,13 @@ impl DrmLeaseState {
             + 'static,
     {
         let lease_ref = {
-            if let Some(pos) = self
+            let pos = self
                 .active_leases
                 .iter()
-                .position(|lease| lease.lease_id.get() == id)
-            {
-                let lease = self.active_leases.remove(pos);
-                self.resume_internal::<D>(Some(&lease.connectors));
-                lease
-            } else {
-                return None;
-            }
+                .position(|lease| lease.lease_id.get() == id)?;
+            let lease = self.active_leases.remove(pos);
+            self.resume_internal::<D>(Some(&lease.connectors));
+            lease
         };
         lease_ref.force_close();
         Some(lease_ref)

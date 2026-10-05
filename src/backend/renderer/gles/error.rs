@@ -143,6 +143,7 @@ impl From<GlesError> for SwapBuffersError {
             | x @ GlesError::ContextReset => SwapBuffersError::ContextLost(Box::new(x)),
             GlesError::ContextActivationError(err) => err.into(),
             x @ GlesError::FramebufferBindingError
+            | x @ GlesError::ComputeDispatchError(_)
             | x @ GlesError::MappingError
             | x @ GlesError::UnknownPixelFormat
             | x @ GlesError::UnsupportedPixelFormat(_)
