@@ -204,13 +204,8 @@ where
         slot.0.age.store(1, Ordering::SeqCst);
         for other_slot in &mut self.slots {
             if !Arc::ptr_eq(other_slot, &slot.0) && other_slot.buffer.is_some() {
-                let res = other_slot
-                    .age
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |age| {
-                        if age > 0 { age.checked_add(1) } else { Some(0) }
-                    });
                 // If the age overflows the slot was not used for a long time. Lets clear it
-                if res.is_err() {
+                if !advance_age(&other_slot.age) {
                     *other_slot = Default::default();
                 }
             }
@@ -258,5 +253,37 @@ where
     /// Get allowed modifiers
     pub fn modifiers(&self) -> &[Modifier] {
         &self.modifiers
+    }
+}
+
+// Keep fetch_update's ordering and overflow semantics on the supported MSRV.
+fn advance_age(age: &AtomicU8) -> bool {
+    let mut previous = age.load(Ordering::SeqCst);
+    loop {
+        let next = if previous == 0 {
+            0
+        } else if let Some(next) = previous.checked_add(1) {
+            next
+        } else {
+            return false;
+        };
+        match age.compare_exchange_weak(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(current) => previous = current,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn buffer_age_keeps_unknown_advances_known_and_reports_overflow() {
+        for (before, after, success) in [(0, 0, true), (1, 2, true), (254, 255, true), (255, 255, false)] {
+            let age = AtomicU8::new(before);
+            assert_eq!(advance_age(&age), success);
+            assert_eq!(age.load(Ordering::SeqCst), after);
+        }
     }
 }
