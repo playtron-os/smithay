@@ -819,7 +819,9 @@ mod tests {
 
         // Reused across "frames": the list must not accumulate cleared history.
         for _ in 0..1000 {
-            region.rects.push((RectangleKind::Add, Rectangle::from_size((10, 10).into())));
+            region
+                .rects
+                .push((RectangleKind::Add, Rectangle::from_size((10, 10).into())));
             region.push_subtract(Rectangle::new((-10000, -10000).into(), (100000, 100000).into()));
         }
         assert!(region.rects.is_empty());
@@ -831,7 +833,11 @@ mod tests {
             rects: vec![(RectangleKind::Add, Rectangle::from_size((10, 10).into()))],
         };
         region.push_subtract(Rectangle::from_size((5, 5).into()));
-        assert_eq!(region.rects.len(), 2, "a subtract that leaves area behind is a real op");
+        assert_eq!(
+            region.rects.len(),
+            2,
+            "a subtract that leaves area behind is a real op"
+        );
         assert!(!region.contains((0, 0)));
         assert!(region.contains((7, 7)));
     }
