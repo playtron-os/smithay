@@ -124,6 +124,10 @@ impl Source for WlDataSource {
             .map(|data| data.inner.lock().unwrap().clone())
     }
 
+    fn target(&self, mime_type: Option<&str>) {
+        WlDataSource::target(self, mime_type.map(str::to_owned));
+    }
+
     fn choose_action(&self, action: DndAction) {
         self.action(action.into());
     }

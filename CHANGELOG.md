@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Additions
+
+`dnd::Source::target` tells a drag source whether the target under the pointer accepts its data.
+A `wl_data_source` now receives the `target` event: on every `wl_data_offer.accept`, on X11's
+`XdndStatus`, and with no type when the pointer leaves the target.
+
 ### Breaking changes
 
 `crate::wayland::selection::data_device::start_dnd` was removed in favor of exposing the
