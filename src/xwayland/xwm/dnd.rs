@@ -313,6 +313,13 @@ impl XWmDnd {
             if offer_state.target == data[0] {
                 let mut pos_update = false;
                 offer_state.client_accepts = (data[1] & 1) != 0;
+                // XdndStatus names no type; the first offered one stands for the accepted data.
+                let accepted = offer_state
+                    .client_accepts
+                    .then(|| offer.source.metadata())
+                    .flatten()
+                    .and_then(|meta| meta.mime_types.into_iter().next());
+                offer.source.target(accepted.as_deref());
 
                 if !offer_state.dropped {
                     let old_action = offer_state.preferred_action;
@@ -1208,6 +1215,7 @@ impl<D: XwmHandler + SeatHandler> DndFocus<D> for X11Surface {
 impl<S: Source> OfferData for XwmOfferData<S> {
     fn disable(&self) {
         self.state.lock().unwrap().active = false;
+        self.source.target(None);
     }
 
     fn drop(&self) {

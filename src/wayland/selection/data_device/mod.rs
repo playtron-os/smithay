@@ -256,13 +256,13 @@ fn handle_dnd<D, S>(
     match request {
         Request::Accept { mime_type, .. } => {
             if let Some(source) = source.as_ref() {
-                if let Some(mtype) = mime_type {
-                    data.accepted = source
+                let accepted = mime_type.filter(|mtype| {
+                    source
                         .metadata()
-                        .is_some_and(|meta| meta.mime_types.contains(&mtype));
-                } else {
-                    data.accepted = false;
-                }
+                        .is_some_and(|meta| meta.mime_types.contains(mtype))
+                });
+                data.accepted = accepted.is_some();
+                source.target(accepted.as_deref());
             } else if data.finished {
                 offer.post_error(
                     wl_data_offer::Error::InvalidFinish,
@@ -388,6 +388,7 @@ pub struct WlOfferData<S: Source> {
 impl<S: Source> OfferData for WlOfferData<S> {
     fn disable(&self) {
         self.state.lock().unwrap().active = false;
+        self.source.target(None);
         self.source.choose_action(DndAction::None);
         for offer in &self.wl_offers {
             if let Some(data) = offer

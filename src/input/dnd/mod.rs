@@ -63,6 +63,10 @@ pub trait Source: IsAlive + Send + Sync + 'static {
     ///
     /// If this returns `None` the source is not managed by smithay (e.g. client_local)
     fn metadata(&self) -> Option<SourceMetadata>;
+    /// The target under the pointer accepted `mime_type`, or none of the offered types (`None`)
+    fn target(&self, mime_type: Option<&str>) {
+        let _ = mime_type;
+    }
     /// An action was selected by the target
     fn choose_action(&self, action: DndAction);
     /// The target requests data to be transferred to the given file descriptor for the given mime-type
