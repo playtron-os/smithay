@@ -3155,10 +3155,10 @@ mod workarea_tests {
 
     #[test]
     fn workarea_scales_inwards() {
-        // 2560x1440 at 150% is 1707x960 logical, rounded up; a 62 px bottom panel.
-        let area = Rectangle::new((0, 0).into(), (1707, 898).into());
-        assert_eq!(workarea_in_root(area, 1.5), [0, 0, 2560, 1347]);
-        assert_eq!(workarea_in_root(area, 1.), [0, 0, 1707, 898]);
+        // 2560x1440 at 150% is 1707x960 logical, rounded up; a 52 px bottom panel.
+        let area = Rectangle::new((0, 0).into(), (1707, 908).into());
+        assert_eq!(workarea_in_root(area, 1.5), [0, 0, 2560, 1362]);
+        assert_eq!(workarea_in_root(area, 1.), [0, 0, 1707, 908]);
         // A top panel: the area starts on the first whole root pixel below it.
         let area = Rectangle::new((0, 33).into(), (1707, 927).into());
         assert_eq!(workarea_in_root(area, 1.5), [0, 50, 2560, 1390]);
