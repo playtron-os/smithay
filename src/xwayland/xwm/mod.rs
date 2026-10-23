@@ -284,6 +284,7 @@ mod atoms {
             _NET_WM_SYNC_REQUEST,
             _NET_WM_SYNC_REQUEST_COUNTER,
             _NET_SHOWING_DESKTOP,
+            _NET_WORKAREA,
             _NET_SUPPORTING_WM_CHECK,
             _XSETTINGS_SETTINGS,
             _XWAYLAND_ALLOW_COMMITS,
@@ -635,6 +636,7 @@ pub struct X11Wm {
     client_list_stacking: Vec<X11Window>,
 
     is_showing_desktop: bool,
+    workarea: Option<Rectangle<i32, Client>>,
 
     // The managed window holding X input focus, and the window `_NET_ACTIVE_WINDOW` stays on
     // instead while one is set.
@@ -973,6 +975,7 @@ impl X11Wm {
             atoms._NET_CLIENT_LIST,
             atoms._NET_CLIENT_LIST_STACKING,
             atoms._NET_SHOWING_DESKTOP,
+            atoms._NET_WORKAREA,
             atoms._NET_WM_OPAQUE_REGION,
             atoms._NET_WM_PING,
             atoms._GTK_FRAME_EXTENTS,
@@ -1115,6 +1118,7 @@ impl X11Wm {
             client_list: Vec::new(),
             client_list_stacking: Vec::new(),
             is_showing_desktop: false,
+            workarea: None,
             focused_window: None,
             active_window_override: None,
             focus_release,
@@ -1563,6 +1567,46 @@ impl X11Wm {
     /// Returns the state of the "showing desktop" flag
     pub fn is_showing_desktop(&self) -> bool {
         self.is_showing_desktop
+    }
+
+    /// Sets the work area: the part of the root window that panels leave free, in root
+    /// coordinates (client-scaled), or `None` for none.
+    ///
+    /// This updates the `_NET_WORKAREA` property on the root window. X clients size their
+    /// maximized windows from it (Wine takes a monitor's work area from it), so without one
+    /// they assume the whole screen. There is one area for all desktops.
+    pub fn set_workarea(&mut self, workarea: Option<Rectangle<i32, Client>>) -> Result<(), ConnectionError> {
+        if self.workarea == workarea {
+            return Ok(());
+        }
+        match workarea {
+            Some(area) => {
+                self.conn.change_property32(
+                    PropMode::REPLACE,
+                    self.screen.root,
+                    self.atoms._NET_WORKAREA,
+                    AtomEnum::CARDINAL,
+                    &[
+                        area.loc.x.max(0) as u32,
+                        area.loc.y.max(0) as u32,
+                        area.size.w.max(0) as u32,
+                        area.size.h.max(0) as u32,
+                    ],
+                )?;
+            }
+            None => {
+                self.conn
+                    .delete_property(self.screen.root, self.atoms._NET_WORKAREA)?;
+            }
+        }
+        self.conn.flush()?;
+        self.workarea = workarea;
+        Ok(())
+    }
+
+    /// Returns the work area last set with [`X11Wm::set_workarea`]
+    pub fn workarea(&self) -> Option<Rectangle<i32, Client>> {
+        self.workarea
     }
 
     /// Keeps `_NET_ACTIVE_WINDOW` on `window` while X input focus moves elsewhere, as gamescope
