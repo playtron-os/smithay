@@ -636,7 +636,8 @@ pub struct X11Wm {
     client_list_stacking: Vec<X11Window>,
 
     is_showing_desktop: bool,
-    workarea: Option<Rectangle<i32, Client>>,
+    // `_NET_WORKAREA` as last set: x, y, width, height in root pixels.
+    workarea: Option<[u32; 4]>,
 
     // The managed window holding X input focus, and the window `_NET_ACTIVE_WINDOW` stays on
     // instead while one is set.
@@ -1569,29 +1570,27 @@ impl X11Wm {
         self.is_showing_desktop
     }
 
-    /// Sets the work area: the part of the root window that panels leave free, in root
-    /// coordinates (client-scaled), or `None` for none.
+    /// Sets the work area: the part of the root window that panels leave free, or `None`
+    /// for none.
     ///
     /// This updates the `_NET_WORKAREA` property on the root window. X clients size their
-    /// maximized windows from it (Wine takes a monitor's work area from it), so without one
-    /// they assume the whole screen. There is one area for all desktops.
-    pub fn set_workarea(&mut self, workarea: Option<Rectangle<i32, Client>>) -> Result<(), ConnectionError> {
-        if self.workarea == workarea {
+    /// maximized windows from it (Wine takes each monitor's work area from it), so without
+    /// one they assume the whole screen. There is one area for all desktops. It is scaled
+    /// as windows are, rounding inwards so it never covers what it leaves out.
+    pub fn set_workarea(&mut self, workarea: Option<Rectangle<i32, Logical>>) -> Result<(), ConnectionError> {
+        let scale = self.client_scale.load(Ordering::Acquire);
+        let root = workarea.map(|area| workarea_in_root(area, scale));
+        if self.workarea == root {
             return Ok(());
         }
-        match workarea {
+        match root {
             Some(area) => {
                 self.conn.change_property32(
                     PropMode::REPLACE,
                     self.screen.root,
                     self.atoms._NET_WORKAREA,
                     AtomEnum::CARDINAL,
-                    &[
-                        area.loc.x.max(0) as u32,
-                        area.loc.y.max(0) as u32,
-                        area.size.w.max(0) as u32,
-                        area.size.h.max(0) as u32,
-                    ],
+                    &area,
                 )?;
             }
             None => {
@@ -1600,13 +1599,8 @@ impl X11Wm {
             }
         }
         self.conn.flush()?;
-        self.workarea = workarea;
+        self.workarea = root;
         Ok(())
-    }
-
-    /// Returns the work area last set with [`X11Wm::set_workarea`]
-    pub fn workarea(&self) -> Option<Rectangle<i32, Client>> {
-        self.workarea
     }
 
     /// Keeps `_NET_ACTIVE_WINDOW` on `window` while X input focus moves elsewhere, as gamescope
@@ -3143,4 +3137,30 @@ fn atom_from_mime(
             .reply_unchecked()?
             .map(|reply| reply.atom),
     })
+}
+
+/// `area` in root pixels at `scale`, as `_NET_WORKAREA` holds it: its edges rounded inwards.
+fn workarea_in_root(area: Rectangle<i32, Logical>, scale: f64) -> [u32; 4] {
+    let start = |at: i32| (at as f64 * scale).ceil().max(0.) as u32;
+    let end = |at: i32| (at as f64 * scale).floor().max(0.) as u32;
+    let (x, y) = (start(area.loc.x), start(area.loc.y));
+    let (right, bottom) = (end(area.loc.x + area.size.w), end(area.loc.y + area.size.h));
+    [x, y, right.saturating_sub(x), bottom.saturating_sub(y)]
+}
+
+#[cfg(test)]
+mod workarea_tests {
+    use super::workarea_in_root;
+    use crate::utils::Rectangle;
+
+    #[test]
+    fn workarea_scales_inwards() {
+        // 2560x1440 at 150% is 1707x960 logical, rounded up; a 62 px bottom panel.
+        let area = Rectangle::new((0, 0).into(), (1707, 898).into());
+        assert_eq!(workarea_in_root(area, 1.5), [0, 0, 2560, 1347]);
+        assert_eq!(workarea_in_root(area, 1.), [0, 0, 1707, 898]);
+        // A top panel: the area starts on the first whole root pixel below it.
+        let area = Rectangle::new((0, 33).into(), (1707, 927).into());
+        assert_eq!(workarea_in_root(area, 1.5), [0, 50, 2560, 1390]);
+    }
 }
