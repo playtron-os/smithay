@@ -8,6 +8,9 @@
 A `wl_data_source` now receives the `target` event: on every `wl_data_offer.accept`, on X11's
 `XdndStatus`, and with no type when the pointer leaves the target.
 
+`X11Wm::set_workarea` publishes `_NET_WORKAREA`, the part of the root that panels leave free.
+X clients such as Wine size their maximized windows from it; without one they take the whole screen.
+
 ### Breaking changes
 
 `crate::wayland::selection::data_device::start_dnd` was removed in favor of exposing the
