@@ -156,7 +156,7 @@ use std::{
         net::UnixStream,
     },
     sync::{
-        Arc, Weak,
+        Arc, Mutex, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -613,6 +613,8 @@ pub struct X11Wm {
     conn: Arc<RustConnection>,
     client_scale: Arc<AtomicF64>,
     screen: Screen,
+    /// The root window's size, shared with the surfaces for exact screen-sized configures.
+    root_size: Arc<Mutex<Size<i32, Client>>>,
     wm_window: OwnedX11Window,
     atoms: Atoms,
     servertime_counter: Option<Counter>,
@@ -1102,6 +1104,10 @@ impl X11Wm {
             id,
             conn,
             client_scale,
+            root_size: Arc::new(Mutex::new(Size::from((
+                screen.width_in_pixels as i32,
+                screen.height_in_pixels as i32,
+            )))),
             screen,
             atoms,
             servertime_counter,
@@ -1747,13 +1753,14 @@ where
             // CreateNotify already carries the initial geometry — no need for a
             // blocking GetGeometry round trip (which is a hot path when apps like
             // Zoom create windows rapidly and causes main-loop stalls).
-            let geometry = Rectangle::<i32, Client>::new(
+            let client_geometry = Rectangle::<i32, Client>::new(
                 (n.x as i32, n.y as i32).into(),
                 (n.width as i32, n.height as i32).into(),
-            )
-            .to_f64()
-            .to_logical(xwm.client_scale.load(Ordering::Acquire))
-            .to_i32_round();
+            );
+            let geometry = client_geometry
+                .to_f64()
+                .to_logical(xwm.client_scale.load(Ordering::Acquire))
+                .to_i32_round();
 
             let surface = X11Surface::new(
                 Some(xwm),
@@ -1766,6 +1773,7 @@ where
                 xwm.dnd.xdnd_active.clone(),
             );
 
+            surface.state.lock().unwrap().client_geometry = Some(client_geometry);
             xwm.windows.push(surface.clone());
 
             drop(_guard);
@@ -1839,7 +1847,14 @@ where
                             .push(Reverse(cookie2.sequence_number() as u16));
                     }
 
-                    surface.state.lock().unwrap().mapped_onto = Some(frame_win);
+                    {
+                        let mut state = surface.state.lock().unwrap();
+                        state.mapped_onto = Some(frame_win);
+                        state.client_geometry = Some(Rectangle::new(
+                            (geo.x as i32, geo.y as i32).into(),
+                            (geo.width as i32, geo.height as i32).into(),
+                        ));
+                    }
 
                     // A MapRequest can only happen when an X11 window does not have the
                     // override-redirect flag set. It's possible for a window to be created as
@@ -2005,13 +2020,11 @@ where
             trace!(window = ?n, "configured X11 Window");
 
             let client_scale = xwm.client_scale.load(Ordering::Acquire);
-            let geometry = Rectangle::<i32, Client>::new(
+            let client_geometry = Rectangle::<i32, Client>::new(
                 (n.x as i32, n.y as i32).into(),
                 (n.width as i32, n.height as i32).into(),
-            )
-            .to_f64()
-            .to_logical(client_scale)
-            .to_i32_round();
+            );
+            let geometry = client_geometry.to_f64().to_logical(client_scale).to_i32_round();
 
             if let Some(surface) = xwm
                 .windows
@@ -2019,6 +2032,7 @@ where
                 .find(|x| x.mapped_window_id() == Some(n.window))
                 .cloned()
             {
+                surface.state.lock().unwrap().client_geometry = Some(client_geometry);
                 drop(_guard);
                 state.configure_notify(
                     xwm_id,
@@ -2032,7 +2046,10 @@ where
                 );
             } else if let Some(surface) = xwm.windows.iter().find(|x| x.window_id() == n.window).cloned() {
                 if surface.is_override_redirect() {
-                    surface.state.lock().unwrap().last_configure = geometry;
+                    let mut surface_state = surface.state.lock().unwrap();
+                    surface_state.last_configure = geometry;
+                    surface_state.client_geometry = Some(client_geometry);
+                    drop(surface_state);
                     drop(_guard);
                     state.configure_notify(
                         xwm_id,
@@ -3019,6 +3036,7 @@ where
         Event::RandrScreenChangeNotify(n) => {
             xwm.screen.width_in_pixels = n.width;
             xwm.screen.height_in_pixels = n.height;
+            *xwm.root_size.lock().unwrap() = Size::from((n.width as i32, n.height as i32));
             xwm.screen.width_in_millimeters = n.mwidth;
             xwm.screen.height_in_millimeters = n.mheight;
 
