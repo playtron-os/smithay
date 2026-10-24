@@ -1519,25 +1519,6 @@ impl<N: Coordinate, Kind> Rectangle<N, Kind> {
 }
 
 impl<N: Coordinate> Rectangle<N, Logical> {
-    #[inline]
-    #[cfg(feature = "xwayland")]
-    pub(crate) fn to_client(self, scale: impl Into<Scale<N>>) -> Rectangle<N, Client> {
-        let scale = scale.into();
-        Rectangle {
-            loc: self.loc.to_client(scale),
-            size: self.size.to_client(scale),
-        }
-    }
-
-    #[inline]
-    #[cfg(feature = "xwayland")]
-    pub(crate) fn to_client_precise_round<S: Coordinate, R: Coordinate>(
-        self,
-        scale: impl Into<Scale<S>>,
-    ) -> Rectangle<R, Client> {
-        self.to_f64().to_client(scale.into().to_f64()).to_i32_round()
-    }
-
     /// Convert this logical rectangle to physical coordinate space according to given scale factor
     #[inline]
     #[must_use = "this returns the result of the operation, without modifying the original"]

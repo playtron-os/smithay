@@ -64,6 +64,7 @@ use super::{X11Wm, XwmId, send_configure_notify};
 pub struct X11Surface {
     xwm: Option<XwmId>,
     client_scale: Option<Arc<AtomicF64>>,
+    root_size: Option<Arc<Mutex<Size<i32, Client>>>>,
     window: X11Window,
     focus_release: Option<super::FocusReleaseHandle>,
     pub(super) conn: Weak<RustConnection>,
@@ -137,6 +138,8 @@ pub(crate) struct SharedSurfaceState {
     pub(super) wl_surface_serial: Option<u64>,
     pub(super) mapped_onto: Option<X11Window>,
     pub(super) last_configure: Rectangle<i32, Logical>,
+    /// The window's geometry in X11 pixels, as X11 last reported it or was told.
+    pub(super) client_geometry: Option<Rectangle<i32, Client>>,
     pub(super) override_redirect: bool,
     /// True for X11 windows with class `InputOnly` — these have no visual content
     /// and must not intercept Wayland pointer events.
@@ -356,6 +359,7 @@ impl X11Surface {
         X11Surface {
             xwm: xwm.map(|wm| wm.id),
             client_scale: xwm.map(|wm| wm.client_scale.clone()),
+            root_size: xwm.map(|wm| wm.root_size.clone()),
             window,
             conn,
             atoms,
@@ -378,6 +382,7 @@ impl X11Surface {
                 buffered_configure: None,
                 mapped_onto: None,
                 last_configure: geometry,
+                client_geometry: None,
                 override_redirect,
                 input_only: false,
                 input_passthrough: false,
@@ -503,7 +508,9 @@ impl X11Surface {
                 .map(|s| s.load(Ordering::Acquire))
                 .unwrap_or(1.);
             let logical_rect = rect.unwrap_or(state.last_configure);
-            let rect = logical_rect.to_client_precise_round(client_scale);
+            let root = self.root_size.as_ref().map(|size| *size.lock().unwrap());
+            let rect = logical_to_client(logical_rect, client_scale, state.client_geometry, root);
+            state.client_geometry = Some(rect);
             let aux = ConfigureWindowAux::default()
                 .x(rect.loc.x)
                 .y(rect.loc.y)
@@ -2828,6 +2835,106 @@ fn fetch_opaque_regions(
         .map(|rects| RegionAttributes { rects });
 
     Ok(opaque_region)
+}
+
+/// `rect` in X11 pixels, without rounding drift. A position or size that is the logical image
+/// of the window's own X11 one keeps it, so moving a window never resizes it by a pixel; an
+/// edge on the screen's right or bottom edge lands on it exactly. Anything else rounds.
+fn logical_to_client(
+    rect: Rectangle<i32, Logical>,
+    scale: f64,
+    current: Option<Rectangle<i32, Client>>,
+    root: Option<Size<i32, Client>>,
+) -> Rectangle<i32, Client> {
+    let image = |at: i32| (at as f64 / scale).round() as i32;
+    let round = |at: i32| (at as f64 * scale).round() as i32;
+    let axis = |start: i32, len: i32, current: Option<(i32, i32)>, extent: Option<i32>| {
+        let at = match current {
+            Some((at, _)) if image(at) == start => at,
+            _ => round(start),
+        };
+        let len = match (current, extent) {
+            (_, Some(extent)) if image(extent) == start + len => extent - at,
+            (Some((_, current)), _) if image(current) == len => current,
+            _ => round(start + len) - at,
+        };
+        (at, len)
+    };
+    let (x, w) = axis(
+        rect.loc.x,
+        rect.size.w,
+        current.map(|c| (c.loc.x, c.size.w)),
+        root.map(|r| r.w),
+    );
+    let (y, h) = axis(
+        rect.loc.y,
+        rect.size.h,
+        current.map(|c| (c.loc.y, c.size.h)),
+        root.map(|r| r.h),
+    );
+    Rectangle::new((x, y).into(), (w, h).into())
+}
+
+#[cfg(test)]
+mod client_rect_tests {
+    use super::logical_to_client;
+    use crate::utils::{Client, Rectangle, Size};
+
+    fn root() -> Option<Size<i32, Client>> {
+        Some((2560, 1440).into())
+    }
+
+    #[test]
+    fn a_window_keeps_its_pixel_size_when_moved() {
+        // 640x400 at 150% is 426.67x266.67 logical, rounded to 427x267.
+        let current = Rectangle::new((100, 100).into(), (640, 400).into());
+        let centred = Rectangle::new((640, 346).into(), (427, 267).into());
+        assert_eq!(
+            logical_to_client(centred, 1.5, Some(current), root()),
+            Rectangle::new((960, 519).into(), (640, 400).into())
+        );
+        // Without knowing its size, rounding makes it 641x401.
+        assert_eq!(
+            logical_to_client(centred, 1.5, None, root()).size,
+            (641, 401).into()
+        );
+        // A real resize still takes the new size.
+        let larger = Rectangle::new((640, 346).into(), (500, 300).into());
+        assert_eq!(
+            logical_to_client(larger, 1.5, Some(current), root()).size,
+            (750, 450).into()
+        );
+    }
+
+    #[test]
+    fn a_window_sized_to_the_screen_is_exactly_the_screen() {
+        // 2560x1440 at 150% is 1707x960 logical; 1707 * 1.5 rounds to 2561.
+        let screen = Rectangle::new((0, 0).into(), (1707, 960).into());
+        let current = Rectangle::new((960, 519).into(), (641, 401).into());
+        assert_eq!(
+            logical_to_client(screen, 1.5, Some(current), root()),
+            Rectangle::new((0, 0).into(), (2560, 1440).into())
+        );
+        // Below a 52 px top panel, the bottom edge still lands on the screen's.
+        let under_panel = Rectangle::new((0, 52).into(), (1707, 908).into());
+        assert_eq!(
+            logical_to_client(under_panel, 1.5, None, root()),
+            Rectangle::new((0, 78).into(), (2560, 1362).into())
+        );
+    }
+
+    #[test]
+    fn whole_scales_are_unchanged() {
+        let rect = Rectangle::new((10, 20).into(), (300, 200).into());
+        assert_eq!(
+            logical_to_client(rect, 2.0, None, root()),
+            Rectangle::new((20, 40).into(), (600, 400).into())
+        );
+        assert_eq!(
+            logical_to_client(rect, 1.0, None, None),
+            Rectangle::new((10, 20).into(), (300, 200).into())
+        );
+    }
 }
 
 #[cfg(test)]
