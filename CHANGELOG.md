@@ -11,6 +11,9 @@ A `wl_data_source` now receives the `target` event: on every `wl_data_offer.acce
 `X11Wm::set_workarea` publishes `_NET_WORKAREA`, the part of the root that panels leave free.
 X clients such as Wine size their maximized windows from it; without one they take the whole screen.
 
+`X11Surface::motif_decorations` returns the decorations a window asked for in `_MOTIF_WM_HINTS`,
+so a compositor can tell a window that wants a title bar from one that wants only a border.
+
 ### Breaking changes
 
 `crate::wayland::selection::data_device::start_dnd` was removed in favor of exposing the

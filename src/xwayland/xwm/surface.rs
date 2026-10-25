@@ -96,6 +96,13 @@ const MWM_HINTS_FLAGS_FIELD: usize = 0;
 const MWM_HINTS_DECORATIONS_FIELD: usize = 2;
 const MWM_HINTS_DECORATIONS: u32 = 1 << 1;
 
+// Clients control the length of the _MOTIF_WM_HINTS array, so index defensively:
+// a short or empty array must not panic and poison the surface state lock.
+fn motif_decorations(hints: &[u32]) -> Option<u32> {
+    let flags = hints.get(MWM_HINTS_FLAGS_FIELD).copied().unwrap_or(0);
+    (flags & MWM_HINTS_DECORATIONS != 0).then(|| hints.get(MWM_HINTS_DECORATIONS_FIELD).copied().unwrap_or(0))
+}
+
 const DEFAULT_SYNC_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
 // From http://fishsoup.net/misc/wm-spec-synchronization.html
 //   "If the client is continually redrawing, then the last seen value may be out of date when the
@@ -1401,20 +1408,16 @@ impl X11Surface {
 
     /// Returns true if the window is client-side decorated
     pub fn is_decorated(&self) -> bool {
-        let state = self.state.lock().unwrap();
-        // Clients control the length of the _MOTIF_WM_HINTS array, so index
-        // defensively — a short/empty array (e.g. from some Xlib/XCB toolkits)
-        // must not panic and poison the surface state lock.
-        let flags = state.motif_hints.get(MWM_HINTS_FLAGS_FIELD).copied().unwrap_or(0);
-        if (flags & MWM_HINTS_DECORATIONS) != 0 {
-            return state
-                .motif_hints
-                .get(MWM_HINTS_DECORATIONS_FIELD)
-                .copied()
-                .unwrap_or(0)
-                == 0;
-        }
-        false
+        self.motif_decorations() == Some(0)
+    }
+
+    /// The decorations field of `_MOTIF_WM_HINTS`, if the client set one.
+    ///
+    /// Bits follow Motif: 1 all (the other bits then name what to leave out),
+    /// 2 border, 4 resize handles, 8 title, 16 menu, 32 minimize, 64 maximize.
+    /// Wine asks for a border alone on a captionless window, for example.
+    pub fn motif_decorations(&self) -> Option<u32> {
+        motif_decorations(&self.state.lock().unwrap().motif_hints)
     }
 
     /// Sets the window as maximized or not.
@@ -2825,4 +2828,30 @@ fn fetch_opaque_regions(
         .map(|rects| RegionAttributes { rects });
 
     Ok(opaque_region)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::motif_decorations;
+
+    #[test]
+    fn motif_decorations_need_the_decorations_flag() {
+        assert_eq!(motif_decorations(&[]), None);
+        assert_eq!(
+            motif_decorations(&[0x1, 0x3c, 0x7a, 0, 0]),
+            None,
+            "functions only"
+        );
+        assert_eq!(motif_decorations(&[0x3, 0x3c, 0x7a, 0, 0]), Some(0x7a));
+        assert_eq!(
+            motif_decorations(&[0x2, 0, 0x2, 0, 0]),
+            Some(0x2),
+            "a border alone"
+        );
+        assert_eq!(
+            motif_decorations(&[0x2, 0]),
+            Some(0),
+            "a short array asks for none"
+        );
+    }
 }
