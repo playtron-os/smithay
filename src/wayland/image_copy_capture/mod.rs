@@ -291,6 +291,11 @@ impl SessionRef {
         self.inner.lock().unwrap().constraints.clone()
     }
 
+    /// The client capturing, while it is connected.
+    pub fn client(&self) -> Option<Client> {
+        self.obj.client()
+    }
+
     /// Get the capture source for this session.
     pub fn source(&self) -> ImageCaptureSource {
         self.inner.lock().unwrap().source.clone()

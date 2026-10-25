@@ -72,6 +72,7 @@ pub mod image_copy_capture;
 pub mod input_method;
 pub mod keyboard_shortcuts_inhibit;
 pub mod output;
+pub mod pending;
 pub mod pointer_constraints;
 pub mod pointer_gestures;
 pub mod pointer_warp;

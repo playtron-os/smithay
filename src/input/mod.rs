@@ -164,6 +164,17 @@ pub trait SeatHandler: Sized {
 
     /// Callback that will be notified whenever the keyboard led state changes.
     fn led_state_changed(&mut self, _seat: &Seat<Self>, _led_state: LedState) {}
+
+    /// A virtual keyboard's request, to carry out now, keep or refuse: see
+    /// [`crate::wayland::pending`]. Carried out at once by default.
+    #[cfg(feature = "wayland_frontend")]
+    fn virtual_keyboard_request(
+        &mut self,
+        _client: &wayland_server::Client,
+        request: crate::wayland::pending::Pending<Self>,
+    ) {
+        request.run(self)
+    }
 }
 /// Delegate type for all [Seat] globals.
 ///

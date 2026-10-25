@@ -21,6 +21,7 @@ use crate::{
     utils::SERIAL_COUNTER,
     wayland::{
         Dispatch2,
+        pending::{Effect, Pending},
         seat::{WaylandFocus, keyboard::for_each_focused_kbds},
     },
 };
@@ -79,11 +80,44 @@ where
     fn request(
         &self,
         user_data: &mut D,
-        _client: &Client,
+        client: &Client,
         virtual_keyboard: &ZwpVirtualKeyboardV1,
         request: zwp_virtual_keyboard_v1::Request,
         _dh: &DisplayHandle,
         _data_init: &mut DataInit<'_, D>,
+    ) {
+        let effect = match &request {
+            zwp_virtual_keyboard_v1::Request::Keymap { .. } => Effect::Setup,
+            zwp_virtual_keyboard_v1::Request::Key { .. }
+            | zwp_virtual_keyboard_v1::Request::Modifiers { .. } => Effect::Input,
+            zwp_virtual_keyboard_v1::Request::Destroy => return,
+            _ => unreachable!(),
+        };
+        // The resource keeps its data past a disconnect, so a kept request still replays.
+        let keyboard = virtual_keyboard.clone();
+        let pending = Pending::new(
+            effect,
+            move |state: &mut D| {
+                if let Some(data) = keyboard.data::<VirtualKeyboardUserData<D>>() {
+                    data.handle(state, &keyboard, request);
+                }
+            },
+            |_| {},
+        );
+        user_data.virtual_keyboard_request(client, pending);
+    }
+}
+
+impl<D> VirtualKeyboardUserData<D>
+where
+    D: SeatHandler + 'static,
+    <D as SeatHandler>::KeyboardFocus: WaylandFocus,
+{
+    fn handle(
+        &self,
+        user_data: &mut D,
+        virtual_keyboard: &ZwpVirtualKeyboardV1,
+        request: zwp_virtual_keyboard_v1::Request,
     ) {
         match request {
             zwp_virtual_keyboard_v1::Request::Keymap { format, fd, size } => {
@@ -156,10 +190,7 @@ where
                     }
                 }
             }
-            zwp_virtual_keyboard_v1::Request::Destroy => {
-                // Nothing to do
-            }
-            _ => unreachable!(),
+            _ => {}
         }
     }
 }
