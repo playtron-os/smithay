@@ -14,6 +14,7 @@
 use std::os::unix::io::OwnedFd;
 
 use crate::input::{Seat, SeatHandler};
+use wayland_server::Client;
 
 pub mod data_device;
 pub mod ext_data_control;
@@ -49,6 +50,13 @@ pub trait SelectionHandler: Sized + SeatHandler {
         seat: Seat<Self>,
         user_data: &Self::SelectionUserData,
     ) {
+    }
+
+    /// A data-control client's request to read or set a selection, to carry out now, keep
+    /// or refuse: see [`crate::wayland::pending`]. Carried out at once by default.
+    #[allow(unused_variables)]
+    fn data_control_request(&mut self, client: &Client, request: crate::wayland::pending::Pending<Self>) {
+        request.run(self)
     }
 }
 

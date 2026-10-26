@@ -23,6 +23,7 @@ use zwlr_data_control_offer_v1::Request as DataControlRequest;
 use zwp_primary_selection_offer_v1::Request as PrimaryRequest;
 
 use crate::input::Seat;
+use crate::wayland::pending::{Effect, Pending};
 
 use super::SelectionHandler;
 use super::device::{DataDeviceKind, SelectionDevice};
@@ -119,6 +120,28 @@ struct OfferReplyData<U: Clone + Send + Sync + 'static> {
     seat: WlSeat,
 }
 
+impl<U: Clone + Send + Sync + 'static> OfferReplyData<U> {
+    fn receive<D>(&self, handle: &mut D, mime_type: String, fd: OwnedFd, object_name: &str)
+    where
+        D: SelectionHandler<SelectionUserData = U> + 'static,
+    {
+        if !self.source.contains_mime_type(&mime_type) {
+            debug!("Denying a {object_name}.receive with invalid mime type");
+            return;
+        }
+        match &self.source {
+            OfferReplySource::Client(source) => {
+                source.send(mime_type, fd);
+            }
+            OfferReplySource::Compositor(source) => {
+                if let Some(seat) = Seat::<D>::from_resource(&self.seat) {
+                    handle.send_selection(source.ty, mime_type, fd, seat, &source.user_data);
+                }
+            }
+        }
+    }
+}
+
 impl<D> ObjectData<D> for OfferReplyData<D::SelectionUserData>
 where
     D: SelectionHandler + 'static,
@@ -131,6 +154,7 @@ where
         msg: Message<ObjectId, OwnedFd>,
     ) -> Option<Arc<dyn ObjectData<D>>> {
         let dh = DisplayHandle::from(dh.clone());
+        let offer_id = msg.sender_id.clone();
 
         // NOTE: we can't parse message more than once, since it expects the `OwnedFd` which
         // we can't clone. To achieve that, we use RTTI passed along the selection data, to
@@ -174,19 +198,23 @@ where
             }
         };
 
-        if !self.source.contains_mime_type(&mime_type) {
-            debug!("Denying a {object_name}.receive with invalid mime type");
-        } else {
-            match &self.source {
-                OfferReplySource::Client(source) => {
-                    source.send(mime_type, fd);
-                }
-                OfferReplySource::Compositor(source) => {
-                    if let Some(seat) = Seat::<D>::from_resource(&self.seat) {
-                        handle.send_selection(source.ty, mime_type, fd, seat, &source.user_data);
-                    }
-                }
+        // Data control reads the selection whenever it likes: the compositor may keep or
+        // refuse that. Dropping a refused read's fd ends it with end of file.
+        let data_control = matches!(
+            self.device_kind,
+            DataDeviceKind::WlrDataControl | DataDeviceKind::ExtDataControl
+        );
+        match dh.get_client(offer_id).ok().filter(|_| data_control) {
+            Some(client) => {
+                let offer = self.clone();
+                let pending = Pending::new(
+                    Effect::Read,
+                    move |handle: &mut D| offer.receive(handle, mime_type, fd, object_name),
+                    |_| {},
+                );
+                handle.data_control_request(&client, pending);
             }
+            None => self.receive(handle, mime_type, fd, object_name),
         }
 
         None
