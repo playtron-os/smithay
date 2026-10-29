@@ -518,12 +518,8 @@ impl X11Surface {
                 .height(rect.size.h as u32)
                 .border_width(0);
             if let Some(frame) = state.mapped_onto {
-                let win_aux = ConfigureWindowAux::default()
-                    .width(rect.size.w as u32)
-                    .height(rect.size.h as u32)
-                    .border_width(0);
                 conn.configure_window(frame, &aux)?;
-                conn.configure_window(self.window, &win_aux)?;
+                conn.configure_window(self.window, &in_frame(rect.size))?;
                 send_configure_notify(&conn, &self.window, rect, false)?;
             } else {
                 conn.configure_window(self.window, &aux)?;
@@ -2875,10 +2871,29 @@ fn logical_to_client(
     Rectangle::new((x, y).into(), (w, h).into())
 }
 
+/// The client's place in its frame: the whole of it. Resizing the frame moves the client by its
+/// window gravity, so the origin is restated with every size.
+fn in_frame(size: Size<i32, Client>) -> ConfigureWindowAux {
+    ConfigureWindowAux::default()
+        .x(0)
+        .y(0)
+        .width(size.w as u32)
+        .height(size.h as u32)
+        .border_width(0)
+}
+
 #[cfg(test)]
 mod client_rect_tests {
     use super::logical_to_client;
     use crate::utils::{Client, Rectangle, Size};
+
+    #[test]
+    fn the_client_starts_at_its_frame_origin() {
+        // A centre-gravity client sits half the growth into a frame that grew without this.
+        let aux = super::in_frame((2561, 1440).into());
+        assert_eq!((aux.x, aux.y), (Some(0), Some(0)));
+        assert_eq!((aux.width, aux.height), (Some(2561), Some(1440)));
+    }
 
     fn root() -> Option<Size<i32, Client>> {
         Some((2560, 1440).into())
