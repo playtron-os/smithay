@@ -2105,15 +2105,9 @@ where
                     )?;
                     if !surface.is_override_redirect() {
                         let mut state = surface.state.lock().unwrap();
-                        conn.reparent_window(
-                            n.window,
-                            xwm.screen.root,
-                            state.last_configure.loc.x as i16,
-                            state.last_configure.loc.y as i16,
-                        )?;
-                        if let Some(frame) = state.mapped_onto.take() {
-                            conn.destroy_window(frame)?;
-                        }
+                        let at = state.last_configure.loc;
+                        let frame = state.mapped_onto.take();
+                        release_withdrawn(&conn, xwm.screen.root, n.window, xwm.atoms.WM_STATE, at, frame)?;
                     }
                 }
                 drop(_guard);
@@ -3157,6 +3151,30 @@ fn atom_from_mime(
     })
 }
 
+/// Hands a managed window its client withdrew back to the root, out of its frame, and
+/// says so in WM_STATE as ICCCM 4.1.3.1 asks. Some clients map it again only after that.
+fn release_withdrawn(
+    conn: &RustConnection,
+    root: X11Window,
+    window: X11Window,
+    wm_state: Atom,
+    at: Point<i32, Logical>,
+    frame: Option<X11Window>,
+) -> Result<(), ConnectionError> {
+    conn.reparent_window(window, root, at.x as i16, at.y as i16)?;
+    if let Some(frame) = frame {
+        conn.destroy_window(frame)?;
+    }
+    conn.change_property32(
+        PropMode::REPLACE,
+        window,
+        wm_state,
+        wm_state,
+        &[0 /*WithdrawnState*/, 0 /*WINDOW_NONE*/],
+    )?;
+    Ok(())
+}
+
 /// `area` in root pixels at `scale`, as `_NET_WORKAREA` holds it: its edges rounded inwards.
 fn workarea_in_root(area: Rectangle<i32, Logical>, scale: f64) -> [u32; 4] {
     let start = |at: i32| (at as f64 * scale).ceil().max(0.) as u32;
@@ -3180,5 +3198,69 @@ mod workarea_tests {
         // A top panel: the area starts on the first whole root pixel below it.
         let area = Rectangle::new((0, 33).into(), (1707, 927).into());
         assert_eq!(workarea_in_root(area, 1.5), [0, 50, 2560, 1390]);
+    }
+}
+
+#[cfg(test)]
+mod withdraw_tests {
+    use super::release_withdrawn;
+    use std::io::Read;
+    use x11rb::{
+        connection::Connection,
+        protocol::xproto::Setup,
+        rust_connection::{DefaultStream, RustConnection},
+    };
+
+    const CHANGE_PROPERTY: u8 = 18;
+
+    /// The requests a call makes, as (opcode, body after the 4-byte header).
+    fn requests(call: impl FnOnce(&RustConnection)) -> Vec<(u8, Vec<u8>)> {
+        let (ours, mut server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let setup = Setup {
+            maximum_request_length: u16::MAX,
+            resource_id_mask: 0x1f_ffff,
+            ..Setup::default()
+        };
+        let conn =
+            RustConnection::for_connected_stream(DefaultStream::from_unix_stream(ours).unwrap().0, setup)
+                .unwrap();
+        call(&conn);
+        conn.flush().unwrap();
+        drop(conn);
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).unwrap();
+        let mut out = Vec::new();
+        while bytes.len() >= 4 {
+            let len = u16::from_ne_bytes([bytes[2], bytes[3]]) as usize * 4;
+            out.push((bytes[0], bytes[4..len].to_vec()));
+            bytes.drain(..len);
+        }
+        out
+    }
+
+    fn word(body: &[u8], at: usize) -> u32 {
+        u32::from_ne_bytes(body[at..at + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn a_withdrawn_window_is_told_it_is_withdrawn() {
+        // A client that hides its window to a tray and shows it again waits for this
+        // before mapping it; without it the window never came back.
+        let (root, window, frame, wm_state) = (0x100, 0x200, 0x300, 0x40);
+        let sent = requests(|conn| {
+            release_withdrawn(conn, root, window, wm_state, (10, 20).into(), Some(frame)).unwrap()
+        });
+        // ChangeProperty: window, property, type, format, 3 pad bytes, length, data.
+        let withdrawn = sent.iter().find(|(op, body)| {
+            *op == CHANGE_PROPERTY && word(body, 0) == window && word(body, 4) == wm_state
+        });
+        let (_, body) = withdrawn.expect("WM_STATE was not written");
+        assert_eq!(word(body, 8), wm_state, "the property's type is WM_STATE");
+        assert_eq!((body[12], word(body, 16)), (32, 2), "two 32-bit values");
+        assert_eq!(
+            (word(body, 20), word(body, 24)),
+            (0, 0),
+            "WithdrawnState, no icon window"
+        );
     }
 }
