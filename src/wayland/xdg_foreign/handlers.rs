@@ -105,7 +105,14 @@ where
         // Revoke the previously exported surface.
         // This invalidates any relationship the importer may have set up using the xdg_imported created given the handle sent via xdg_exported.handle.
         invalidate_all_relationships(state, &self.handle);
-        state.xdg_foreign_state().exported.remove(&self.handle);
+        if let Some(exported) = state.xdg_foreign_state().exported.remove(&self.handle) {
+            // Every import of the handle is told it is gone, as the protocol asks.
+            for imported in exported.imported_by {
+                if imported.is_alive() {
+                    imported.destroyed();
+                }
+            }
+        }
     }
 }
 
