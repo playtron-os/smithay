@@ -41,7 +41,7 @@ where
 impl<D> Dispatch2<ZxdgExporterV2, D> for GlobalData
 where
     D: Dispatch<ZxdgExportedV2, XdgExportedUserData>,
-    D: XdgForeignHandler,
+    D: XdgForeignHandler + XdgShellHandler,
 {
     fn request(
         &self,
@@ -71,12 +71,19 @@ where
                 );
                 exported.handle(handle.as_str().to_owned());
 
+                // The export ends with its surface, even while the client keeps the xdg_exported.
+                let revoked = handle.clone();
+                let destruction_hook = compositor::add_destruction_hook::<D, _>(&surface, move |state, _| {
+                    revoke_export(state, &revoked);
+                });
+
                 state.xdg_foreign_state().exported.insert(
                     handle,
                     ExportedState {
                         exported_surface: surface,
                         requested_child: None,
                         imported_by: HashSet::new(),
+                        destruction_hook,
                     },
                 );
             }
@@ -102,15 +109,26 @@ where
     }
 
     fn destroyed(&self, state: &mut D, _client: ClientId, _resource: &ZxdgExportedV2) {
-        // Revoke the previously exported surface.
-        // This invalidates any relationship the importer may have set up using the xdg_imported created given the handle sent via xdg_exported.handle.
-        invalidate_all_relationships(state, &self.handle);
-        if let Some(exported) = state.xdg_foreign_state().exported.remove(&self.handle) {
-            // Every import of the handle is told it is gone, as the protocol asks.
-            for imported in exported.imported_by {
-                if imported.is_alive() {
-                    imported.destroyed();
-                }
+        if let Some(exported) = state.xdg_foreign_state().exported.get(&self.handle) {
+            if exported.exported_surface.is_alive() {
+                compositor::remove_destruction_hook(&exported.exported_surface, &exported.destruction_hook);
+            }
+        }
+        revoke_export(state, &self.handle);
+    }
+}
+
+/// Revokes an export, when its xdg_exported or its surface is destroyed: the child it parents
+/// loses that parent, and every import of the handle is told, as the protocol asks.
+fn revoke_export<D>(state: &mut D, handle: &XdgForeignHandle)
+where
+    D: XdgForeignHandler + XdgShellHandler,
+{
+    invalidate_all_relationships(state, handle);
+    if let Some(exported) = state.xdg_foreign_state().exported.remove(handle) {
+        for imported in exported.imported_by {
+            if imported.is_alive() {
+                imported.destroyed();
             }
         }
     }
