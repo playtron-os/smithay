@@ -16,7 +16,10 @@ use crate::wayland::{
     },
 };
 
-use super::{ExportedState, XdgExportedUserData, XdgForeignHandle, XdgForeignHandler, XdgImportedUserData};
+use super::{
+    ExportedState, ForeignToplevel, XdgExportedUserData, XdgForeignHandle, XdgForeignHandler,
+    XdgImportedUserData,
+};
 
 //
 // Export
@@ -187,18 +190,28 @@ where
                     return;
                 }
 
-                let Some(surface) = state
-                    .foreign_toplevel(client, &handle)
-                    .filter(|surface| surface.is_alive())
-                else {
-                    let imported = data_init.init(
-                        id,
-                        XdgImportedUserData {
-                            handle: XdgForeignHandle(handle),
-                        },
-                    );
-                    imported.destroyed();
-                    return;
+                let surface = match state.foreign_toplevel(client, &handle) {
+                    ForeignToplevel::Surface(surface) if surface.is_alive() => surface,
+                    ForeignToplevel::Unparented => {
+                        // Under a key no export has, it parents nothing and is never destroyed.
+                        data_init.init(
+                            id,
+                            XdgImportedUserData {
+                                handle: XdgForeignHandle::new(),
+                            },
+                        );
+                        return;
+                    }
+                    _ => {
+                        let imported = data_init.init(
+                            id,
+                            XdgImportedUserData {
+                                handle: XdgForeignHandle(handle),
+                            },
+                        );
+                        imported.destroyed();
+                        return;
+                    }
                 };
 
                 // The same name may mean another surface to another importer, so each import

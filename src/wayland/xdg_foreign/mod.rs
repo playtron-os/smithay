@@ -54,13 +54,24 @@ pub trait XdgForeignHandler: 'static {
     /// The toplevel a handle names that no client exported, such as an X11 window the
     /// compositor names by its id. `importer` is the client importing it.
     ///
-    /// The default knows none, so their imports are destroyed at once. A surface returned
-    /// here need not be an `xdg_toplevel`: the import parents the importer's toplevels to it,
-    /// and is told `destroyed` when the surface is, as an import of a client's export is.
-    fn foreign_toplevel(&mut self, importer: &Client, handle: &str) -> Option<WlSurface> {
+    /// The default knows none, so their imports are destroyed at once.
+    fn foreign_toplevel(&mut self, importer: &Client, handle: &str) -> ForeignToplevel {
         let _ = (importer, handle);
-        None
+        ForeignToplevel::Unknown
     }
+}
+
+/// What [`XdgForeignHandler::foreign_toplevel`] makes of a handle no client exported.
+#[derive(Debug)]
+pub enum ForeignToplevel {
+    /// Nothing: the import is destroyed at once, as for any unknown handle.
+    Unknown,
+    /// A toplevel that can't be a parent now, such as a window not mapped yet: the import
+    /// lives on but parents nothing, so the importer carries on as if it had no parent.
+    Unparented,
+    /// The import parents the importer's toplevels to this surface, which need not be an
+    /// `xdg_toplevel`, and is told `destroyed` when the surface is.
+    Surface(WlSurface),
 }
 
 /// The handle contains the unique handle of exported surface.
@@ -190,6 +201,8 @@ mod tests {
         surfaces: Vec<WlSurface>,
         /// What [`XdgForeignHandler::foreign_toplevel`] resolves, by importer and name.
         named: HashMap<(ClientId, String), WlSurface>,
+        /// Names it resolves to [`ForeignToplevel::Unparented`].
+        unparented: HashSet<String>,
     }
 
     #[derive(Default)]
@@ -230,8 +243,12 @@ mod tests {
             &mut self.foreign
         }
 
-        fn foreign_toplevel(&mut self, importer: &Client, handle: &str) -> Option<WlSurface> {
-            self.named.get(&(importer.id(), handle.to_owned())).cloned()
+        fn foreign_toplevel(&mut self, importer: &Client, handle: &str) -> ForeignToplevel {
+            match self.named.get(&(importer.id(), handle.to_owned())) {
+                Some(surface) => ForeignToplevel::Surface(surface.clone()),
+                None if self.unparented.contains(handle) => ForeignToplevel::Unparented,
+                None => ForeignToplevel::Unknown,
+            }
         }
     }
 
@@ -338,6 +355,7 @@ mod tests {
                 foreign: XdgForeignState::new::<Server>(&dh),
                 surfaces: Vec::new(),
                 named: HashMap::new(),
+                unparented: HashSet::new(),
             };
             Self { display, server }
         }
@@ -585,5 +603,27 @@ mod tests {
         surface.destroy();
         harness.pump_peers(&mut owner, &mut child);
         assert_eq!(child.app.destroyed, 0, "no import is left to tell");
+    }
+
+    #[test]
+    fn a_name_that_cannot_parent_yet_keeps_its_import_and_parents_nothing() {
+        let mut harness = Harness::new();
+        let mut owner = harness.connect();
+        let mut child = harness.connect();
+        harness.server.unparented.insert("x11:2".into());
+
+        let dialog = child.window();
+        let imported = child
+            .importer
+            .import_toplevel("x11:2".into(), &child.queue.handle(), ());
+        imported.set_parent_of(&dialog.surface);
+        harness.pump_peers(&mut owner, &mut child);
+        assert_eq!(child.app.destroyed, 0, "the import is not destroyed");
+        assert_eq!(harness.parents(), vec![None], "the dialog has no parent");
+        assert!(harness.server.foreign.exported.is_empty());
+
+        imported.destroy();
+        harness.pump_peers(&mut owner, &mut child);
+        assert_eq!(child.app.destroyed, 0);
     }
 }
