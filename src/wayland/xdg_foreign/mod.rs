@@ -38,7 +38,9 @@ use rand::distr::{Alphanumeric, SampleString};
 use wayland_protocols::xdg::foreign::zv2::server::{
     zxdg_exporter_v2::ZxdgExporterV2, zxdg_imported_v2::ZxdgImportedV2, zxdg_importer_v2::ZxdgImporterV2,
 };
-use wayland_server::{DisplayHandle, GlobalDispatch, backend::GlobalId, protocol::wl_surface::WlSurface};
+use wayland_server::{
+    Client, DisplayHandle, GlobalDispatch, backend::GlobalId, protocol::wl_surface::WlSurface,
+};
 
 use crate::{utils::HookId, wayland::GlobalData};
 
@@ -48,6 +50,17 @@ mod handlers;
 pub trait XdgForeignHandler: 'static {
     /// Returns the xdg foreign state.
     fn xdg_foreign_state(&mut self) -> &mut XdgForeignState;
+
+    /// The toplevel a handle names that no client exported, such as an X11 window the
+    /// compositor names by its id. `importer` is the client importing it.
+    ///
+    /// The default knows none, so their imports are destroyed at once. A surface returned
+    /// here need not be an `xdg_toplevel`: the import parents the importer's toplevels to it,
+    /// and is told `destroyed` when the surface is, as an import of a client's export is.
+    fn foreign_toplevel(&mut self, importer: &Client, handle: &str) -> Option<WlSurface> {
+        let _ = (importer, handle);
+        None
+    }
 }
 
 /// The handle contains the unique handle of exported surface.
@@ -91,6 +104,8 @@ struct ExportedState {
     requested_child: Option<(WlSurface, ZxdgImportedV2)>,
     imported_by: HashSet<ZxdgImportedV2>,
     destruction_hook: HookId,
+    /// Made for one import by [`XdgForeignHandler::foreign_toplevel`], and ended with it.
+    by_compositor: bool,
 }
 
 /// Tracks the list of exported surfaces
@@ -171,6 +186,10 @@ mod tests {
         compositor: CompositorState,
         xdg_shell: XdgShellState,
         foreign: XdgForeignState,
+        /// Every surface made, in order.
+        surfaces: Vec<WlSurface>,
+        /// What [`XdgForeignHandler::foreign_toplevel`] resolves, by importer and name.
+        named: HashMap<(ClientId, String), WlSurface>,
     }
 
     #[derive(Default)]
@@ -191,6 +210,9 @@ mod tests {
             &client.get_data::<ClientState>().unwrap().compositor
         }
         fn commit(&mut self, _surface: &WlSurface) {}
+        fn new_surface(&mut self, surface: &WlSurface) {
+            self.surfaces.push(surface.clone());
+        }
     }
 
     impl XdgShellHandler for Server {
@@ -206,6 +228,10 @@ mod tests {
     impl XdgForeignHandler for Server {
         fn xdg_foreign_state(&mut self) -> &mut XdgForeignState {
             &mut self.foreign
+        }
+
+        fn foreign_toplevel(&mut self, importer: &Client, handle: &str) -> Option<WlSurface> {
+            self.named.get(&(importer.id(), handle.to_owned())).cloned()
         }
     }
 
@@ -268,6 +294,7 @@ mod tests {
     delegate_noop!(App: ignore XdgToplevel);
 
     struct Peer {
+        id: ClientId,
         queue: EventQueue<App>,
         app: App,
         compositor: WlCompositor,
@@ -309,20 +336,25 @@ mod tests {
                 compositor: CompositorState::new::<Server>(&dh),
                 xdg_shell: XdgShellState::new::<Server>(&dh),
                 foreign: XdgForeignState::new::<Server>(&dh),
+                surfaces: Vec::new(),
+                named: HashMap::new(),
             };
             Self { display, server }
         }
 
         fn connect(&mut self) -> Peer {
             let (server_end, client_end) = UnixStream::pair().unwrap();
-            self.display
+            let id = self
+                .display
                 .handle()
                 .insert_client(server_end, Arc::new(ClientState::default()))
-                .unwrap();
+                .unwrap()
+                .id();
             let conn = Connection::from_socket(client_end).unwrap();
             let (globals, queue) = registry_queue_init_pumped(self, &conn);
             let qh = queue.handle();
             let mut peer = Peer {
+                id,
                 compositor: globals.bind(&qh, 1..=5, ()).unwrap(),
                 wm_base: globals.bind(&qh, 1..=1, ()).unwrap(),
                 exporter: globals.bind(&qh, 1..=1, ()).unwrap(),
@@ -461,5 +493,97 @@ mod tests {
         assert_eq!(child.app.destroyed, 1);
         assert_eq!(harness.parents(), vec![None]);
         drop(child_window);
+    }
+    /// A surface of `owner` with no role, as an X11 window's is, that the compositor names
+    /// `name` for `importer`.
+    fn named_surface(harness: &mut Harness, owner: &mut Peer, importer: &Peer, name: &str) -> ClientSurface {
+        let surface = owner.compositor.create_surface(&owner.queue.handle(), ());
+        surface.commit();
+        harness.pump(&mut [(&mut owner.queue, &mut owner.app)]);
+        let server_surface = harness.server.surfaces.last().unwrap().clone();
+        harness
+            .server
+            .named
+            .insert((importer.id.clone(), name.to_owned()), server_surface);
+        surface
+    }
+
+    #[test]
+    fn a_name_the_compositor_resolves_parents_a_dialog_and_ends_with_its_surface() {
+        let mut harness = Harness::new();
+        let mut owner = harness.connect();
+        let mut child = harness.connect();
+        let surface = named_surface(&mut harness, &mut owner, &child, "x11:1");
+        let named = harness.server.surfaces.last().unwrap().clone();
+
+        let dialog = child.window();
+        let imported = child
+            .importer
+            .import_toplevel("x11:1".into(), &child.queue.handle(), ());
+        imported.set_parent_of(&dialog.surface);
+        harness.pump_peers(&mut owner, &mut child);
+        assert_eq!(child.app.destroyed, 0, "the import is live");
+        assert_eq!(
+            harness.parents(),
+            vec![Some(named)],
+            "the dialog's parent is the named surface"
+        );
+
+        surface.destroy();
+        harness.pump_peers(&mut owner, &mut child);
+        assert_eq!(child.app.destroyed, 1, "the import learns its parent is gone");
+        assert_eq!(harness.parents(), vec![None]);
+        assert!(harness.server.foreign.exported.is_empty());
+    }
+
+    #[test]
+    fn a_name_resolves_only_for_the_importer_it_was_resolved_for() {
+        let mut harness = Harness::new();
+        let mut owner = harness.connect();
+        let child = harness.connect();
+        let mut other = harness.connect();
+        let _surface = named_surface(&mut harness, &mut owner, &child, "x11:1");
+
+        let _imported = other
+            .importer
+            .import_toplevel("x11:1".into(), &other.queue.handle(), ());
+        harness.pump_peers(&mut owner, &mut other);
+        assert_eq!(
+            other.app.destroyed, 1,
+            "another client's import of the name is unknown"
+        );
+        assert!(harness.server.foreign.exported.is_empty());
+    }
+
+    #[test]
+    fn a_compositor_export_ends_with_its_import() {
+        let mut harness = Harness::new();
+        let mut owner = harness.connect();
+        let mut child = harness.connect();
+        let surface = named_surface(&mut harness, &mut owner, &child, "x11:1");
+
+        let first = child
+            .importer
+            .import_toplevel("x11:1".into(), &child.queue.handle(), ());
+        let second = child
+            .importer
+            .import_toplevel("x11:1".into(), &child.queue.handle(), ());
+        harness.pump_peers(&mut owner, &mut child);
+        assert_eq!(
+            harness.server.foreign.exported.len(),
+            2,
+            "each import has an export"
+        );
+
+        first.destroy();
+        harness.pump_peers(&mut owner, &mut child);
+        assert_eq!(harness.server.foreign.exported.len(), 1);
+        second.destroy();
+        harness.pump_peers(&mut owner, &mut child);
+        assert!(harness.server.foreign.exported.is_empty());
+
+        surface.destroy();
+        harness.pump_peers(&mut owner, &mut child);
+        assert_eq!(child.app.destroyed, 0, "no import is left to tell");
     }
 }

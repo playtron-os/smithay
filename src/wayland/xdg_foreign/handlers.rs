@@ -11,7 +11,7 @@ use wayland_server::{Client, DataInit, Dispatch, DisplayHandle, New, Resource, b
 use crate::wayland::{
     Dispatch2, GlobalData, GlobalDispatch2, compositor,
     shell::{
-        is_valid_parent,
+        is_toplevel_equivalent, is_valid_parent,
         xdg::{XDG_TOPLEVEL_ROLE, XdgShellHandler, XdgToplevelSurfaceData},
     },
 };
@@ -84,6 +84,7 @@ where
                         requested_child: None,
                         imported_by: HashSet::new(),
                         destruction_hook,
+                        by_compositor: false,
                     },
                 );
             }
@@ -154,14 +155,15 @@ where
     }
 }
 
-impl<D: XdgForeignHandler> Dispatch2<ZxdgImporterV2, D> for GlobalData
+impl<D> Dispatch2<ZxdgImporterV2, D> for GlobalData
 where
     D: Dispatch<ZxdgImportedV2, XdgImportedUserData>,
+    D: XdgForeignHandler + XdgShellHandler,
 {
     fn request(
         &self,
         state: &mut D,
-        _client: &Client,
+        client: &Client,
         _resource: &ZxdgImporterV2,
         request: zxdg_importer_v2::Request,
         _dhandle: &DisplayHandle,
@@ -174,22 +176,49 @@ where
                     .exported
                     .iter_mut()
                     .find(|(key, _)| key.as_str() == handle.as_str());
+                if let Some((_, exported)) = exported {
+                    let imported = data_init.init(
+                        id,
+                        XdgImportedUserData {
+                            handle: XdgForeignHandle(handle),
+                        },
+                    );
+                    exported.imported_by.insert(imported);
+                    return;
+                }
 
-                let imported = data_init.init(
-                    id,
-                    XdgImportedUserData {
-                        handle: XdgForeignHandle(handle),
+                let Some(surface) = state
+                    .foreign_toplevel(client, &handle)
+                    .filter(|surface| surface.is_alive())
+                else {
+                    let imported = data_init.init(
+                        id,
+                        XdgImportedUserData {
+                            handle: XdgForeignHandle(handle),
+                        },
+                    );
+                    imported.destroyed();
+                    return;
+                };
+
+                // The same name may mean another surface to another importer, so each import
+                // gets an export of its own, under a key no client knows.
+                let key = XdgForeignHandle::new();
+                let imported = data_init.init(id, XdgImportedUserData { handle: key.clone() });
+                let revoked = key.clone();
+                let destruction_hook = compositor::add_destruction_hook::<D, _>(&surface, move |state, _| {
+                    revoke_export(state, &revoked);
+                });
+                state.xdg_foreign_state().exported.insert(
+                    key,
+                    ExportedState {
+                        exported_surface: surface,
+                        requested_child: None,
+                        imported_by: HashSet::from([imported]),
+                        destruction_hook,
+                        by_compositor: true,
                     },
                 );
-
-                match exported {
-                    Some((_, state)) => {
-                        state.imported_by.insert(imported);
-                    }
-                    None => {
-                        imported.destroyed();
-                    }
-                }
             }
             zxdg_importer_v2::Request::Destroy => {}
             _ => {}
@@ -219,12 +248,19 @@ where
                     .find(|(key, _)| key.as_str() == self.handle.as_str())
                 {
                     let parent = &exported_state.exported_surface;
+                    // The compositor vouches for its own exports, which may be of another shell;
+                    // such a parent has no parent of its own to make a loop with.
+                    let valid = if exported_state.by_compositor && !is_toplevel_equivalent(parent) {
+                        child != *parent
+                    } else {
+                        is_valid_parent(&child, parent)
+                    };
 
                     let mut invalid = false;
                     let mut changed = false;
                     compositor::with_states(&child, |states| {
                         if let Some(data) = states.data_map.get::<XdgToplevelSurfaceData>() {
-                            if is_valid_parent(&child, parent) {
+                            if valid {
                                 let mut role = data.lock().unwrap();
                                 changed = role.parent.as_ref() != Some(parent);
                                 role.parent = Some(parent.clone());
@@ -273,6 +309,19 @@ where
         }
 
         invalidate_relationship_for(state, &self.handle, Some(resource));
+
+        // A compositor's export lives only as long as the import it was made for.
+        let foreign_state = state.xdg_foreign_state();
+        if foreign_state
+            .exported
+            .get(&self.handle)
+            .is_some_and(|exported| exported.by_compositor)
+        {
+            let exported = foreign_state.exported.remove(&self.handle).unwrap();
+            if exported.exported_surface.is_alive() {
+                compositor::remove_destruction_hook(&exported.exported_surface, &exported.destruction_hook);
+            }
+        }
     }
 }
 
